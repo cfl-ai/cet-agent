@@ -9,8 +9,7 @@ data/audit/
 data/raw/
 data/models/
 data/parsed/
-data/chroma
-data/chroma*
+data/ch*
 data/*.jsonl
 *.log
 *.db
