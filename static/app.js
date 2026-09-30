@@ -157,7 +157,6 @@ function renderQuestions(containerId) {
 
 function playQuestion(idx) {
   const q = currentQuestions[idx];
-  // 提取短文部分（去掉题干），按句切分播放
   const text = q.question.split('\n\n')[0] || q.question;
   speakText(text, 'en-US', 0.85);
 }
@@ -181,7 +180,6 @@ function startVoiceInput(idx) {
   rec.onresult = (e) => {
     const text = e.results[0][0].transcript;
     userAnswers[idx] = text;
-    // 回填到 textarea
     const card = document.querySelector(`.card[data-qidx="${idx}"]`);
     const ta = card.querySelector('textarea');
     if (ta) ta.value = text;
@@ -194,9 +192,14 @@ function startVoiceInput(idx) {
 // ==================== 提交答案 ====================
 async function submitExam(containerId) {
   const answers = currentQuestions.map((q, i) => ({
-    question_id: q.question_id || `q_${Date.now()}_${i}`,
+    question_id: q.question_id,
     user_answer: userAnswers[i] || ''
   }));
+
+  if (answers.some(a => !a.question_id)) {
+    alert('题目ID缺失，请重新生成题目');
+    return;
+  }
 
   const resp = await fetch('/api/exam/evaluate', {
     method: 'POST',
@@ -204,28 +207,70 @@ async function submitExam(containerId) {
     body: JSON.stringify({user_id: USER_ID, answers})
   });
   const data = await resp.json();
-  if (data.code !== 0) { alert('评分失败'); return; }
+  if (data.code !== 0) {
+    alert('评分失败：' + (data.detail || '未知错误'));
+    return;
+  }
 
   const {grading, review} = data.data;
+
+  // 每题标记对错 + 显示答案与解析
   currentQuestions.forEach((q, i) => {
-    const detail = grading.details.find(d => d.question_id === q.question_id)
-                  || grading.details[i];
+    const detail = grading.details.find(d => d.question_id === q.question_id);
     if (!detail) return;
+
+    // 客观题：标记选项颜色
     document.querySelectorAll(`.option[data-q="${i}"]`).forEach(el => {
-      el.classList.remove('selected');
-      if (el.dataset.opt === detail.correct_answer) el.classList.add('correct');
-      else if (el.dataset.opt === userAnswers[i] && !detail.is_correct)
+      el.classList.remove('selected', 'correct', 'wrong');
+      if (el.dataset.opt === detail.correct_answer) {
+        el.classList.add('correct');
+      } else if (el.dataset.opt === userAnswers[i] && detail.is_correct === false) {
         el.classList.add('wrong');
+      }
     });
+
+    // 显示答案与解析
+    const card = document.querySelector(`.card[data-qidx="${i}"]`);
+    if (card && !card.querySelector('.answer-reveal')) {
+      const reveal = document.createElement('div');
+      reveal.className = 'answer-reveal';
+      reveal.style.cssText = 'margin-top:12px;padding:12px;background:#f7fafc;border-radius:8px;font-size:13px;line-height:1.7;';
+
+      let statusLabel, statusColor;
+      if (detail.skipped) {
+        statusLabel = '📝 主观题（请对照参考答案自查）';
+        statusColor = '#4a5568';
+      } else if (detail.is_correct) {
+        statusLabel = '✅ 回答正确';
+        statusColor = '#48bb78';
+      } else {
+        statusLabel = '❌ 回答错误';
+        statusColor = '#f56565';
+      }
+
+      reveal.innerHTML = `
+        <p style="font-weight:600;color:${statusColor};">${statusLabel}</p>
+        <p style="margin-top:6px;"><strong>正确答案：</strong>${detail.correct_answer || '—'}</p>
+        ${detail.explanation ? `<p style="margin-top:6px;color:#4a5568;"><strong>解析：</strong>${detail.explanation}</p>` : ''}
+      `;
+      card.appendChild(reveal);
+    }
   });
 
+  // 本组成绩
   const area = document.getElementById(containerId);
+  const objTotal = grading.objective_total || grading.total;
+  const accPct = (grading.accuracy * 100).toFixed(0);
+  const subjective = grading.total - objTotal;
+
   area.insertAdjacentHTML('beforeend', `
     <div class="card" style="background:#ebf8ff;">
       <h3>📊 本组成绩</h3>
-      <p>正确 ${grading.correct}/${grading.total}，
-         正确率 ${(grading.accuracy*100).toFixed(0)}%</p>
-      <p style="margin-top:8px;font-size:13px;">💡 ${review.suggestion}</p>
+      <p>客观题：<strong>${grading.correct}/${objTotal}</strong>，
+         正确率 <strong>${accPct}%</strong></p>
+      ${subjective > 0 ? `<p style="font-size:12px;color:#718096;margin-top:4px;">
+             共 ${grading.total} 题（含 ${subjective} 道主观题）</p>` : ''}
+      <p style="margin-top:8px;font-size:13px;color:#4a5568;">💡 ${review.suggestion || ''}</p>
     </div>
   `);
 }
@@ -243,7 +288,6 @@ async function startPaper() {
   area.innerHTML = '<div class="loading">准备试卷中...</div>';
 
   try {
-    // 1. 启动会话
     const startResp = await fetch('/api/exam/paper/start', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -255,7 +299,6 @@ async function startPaper() {
     if (startData.code !== 0) throw new Error(startData.detail);
     paperSession = startData.data;
 
-    // 2. 按四六级结构生成试卷题目
     const paperResp = await fetch('/api/exam/generate', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -270,10 +313,8 @@ async function startPaper() {
     currentQuestions = paperData.data.questions;
     userAnswers = {};
 
-    // 3. 渲染计时器
     renderPaperTimer(paperSession.duration_seconds);
     renderQuestions('paper-area');
-    // 4. 定时保存
     setInterval(() => savePaperProgress(), 30000);
   } catch (e) {
     area.innerHTML = `<div style="color:#f56565;">启动失败：${e.message}</div>`;
@@ -326,7 +367,7 @@ async function submitPaper() {
   if (paperTimer) clearInterval(paperTimer);
 
   const answers = currentQuestions.map((q, i) => ({
-    question_id: q.question_id || `paper_${i}`,
+    question_id: q.question_id,
     user_answer: userAnswers[i] || ''
   }));
 
@@ -339,7 +380,6 @@ async function submitPaper() {
     })
   });
 
-  // 评分
   const evalResp = await fetch('/api/exam/evaluate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -352,7 +392,8 @@ async function submitPaper() {
     area.insertAdjacentHTML('afterbegin', `
       <div class="card" style="background:#fff5f5;border-color:#fc8181;">
         <h3>📋 真题演练结束</h3>
-        <p>正确 ${g.correct}/${g.total}，正确率 ${(g.accuracy*100).toFixed(0)}%</p>
+        <p>客观题：${g.correct}/${g.objective_total || g.total}，
+           正确率 ${(g.accuracy*100).toFixed(0)}%</p>
         <p style="font-size:12px;color:#718096;margin-top:8px;">
           会话ID: ${paperSession.session_id}
         </p>

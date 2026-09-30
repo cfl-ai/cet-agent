@@ -88,6 +88,38 @@ class TTSRequest(BaseModel):
     rate: float = 0.9
 
 
+# ==================== 工具函数 ====================
+async def save_questions_to_db(questions: list[dict]):
+    """把生成的题目写入数据库，分配 question_id"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for q in questions:
+            qid = f"ai_{uuid.uuid4().hex[:12]}"
+            q["question_id"] = qid
+
+            options = q.get("options") or []
+            await db.execute("""
+                INSERT OR IGNORE INTO questions
+                (question_id, question_type, topic, difficulty,
+                 content, options, answer, explanation,
+                 knowledge_tags, source, verified, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                qid,
+                q.get("question_type", "综合训练"),
+                q.get("topic", "通用"),
+                q.get("difficulty", 3),
+                q.get("question", ""),
+                json.dumps(options, ensure_ascii=False),
+                q.get("answer", "A"),
+                q.get("explanation", ""),
+                json.dumps(q.get("knowledge_tags", []), ensure_ascii=False),
+                "ai_generated",
+                1,
+                time.time(),
+            ))
+        await db.commit()
+
+
 # ==================== 基础接口 ====================
 @app.get("/api/health")
 async def health():
@@ -98,6 +130,8 @@ async def health():
 async def generate_exam(req: ExamRequest):
     try:
         result = await orchestrator.generate_exam(req.model_dump())
+        # ★ 关键：写入数据库，分配真实 question_id
+        await save_questions_to_db(result["questions"])
         return {"code": 0, "data": result}
     except Exception as e:
         logger.error(f"出题失败: {e}")
@@ -108,8 +142,10 @@ async def generate_exam(req: ExamRequest):
 async def generate_from_wrong(req: WrongExamRequest):
     try:
         result = await orchestrator.generate_from_wrong(req.user_id, req.num)
+        await save_questions_to_db(result["questions"])
         return {"code": 0, "data": result}
     except Exception as e:
+        logger.error(f"错题变式题生成失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -120,26 +156,23 @@ async def evaluate(req: EvaluateRequest):
         result = await orchestrator.evaluate_and_review(req.user_id, answers)
         return {"code": 0, "data": result}
     except Exception as e:
+        logger.error(f"评估失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== 真题演练 ====================
 @app.post("/api/exam/paper/start")
 async def paper_start(req: PaperStartRequest):
-    """开始一套真题演练"""
     session_id = str(uuid.uuid4())
-    # 四级 125 分钟，六级 130 分钟
     duration = 125 * 60 if req.level == "cet4" else 130 * 60
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # 检查是否有未完成的会话
         cursor = await db.execute("""
             SELECT session_id FROM exam_sessions
             WHERE user_id=? AND status='in_progress'
         """, (req.user_id,))
         existing = await cursor.fetchone()
         if existing:
-            # 把旧的未完成会话标记为超时
             await db.execute(
                 "UPDATE exam_sessions SET status='timeout' WHERE session_id=?",
                 (existing[0],)
@@ -168,7 +201,6 @@ async def paper_start(req: PaperStartRequest):
 
 @app.post("/api/exam/paper/submit")
 async def paper_submit(req: PaperSubmitRequest):
-    """提交真题演练"""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT user_id, started_at, duration_seconds FROM exam_sessions WHERE session_id=?",
@@ -196,7 +228,6 @@ async def paper_submit(req: PaperSubmitRequest):
 
 @app.get("/api/exam/paper/session/{session_id}")
 async def paper_session(session_id: str):
-    """查询会话状态"""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             SELECT session_id, user_id, level, year, month, set_number,
@@ -217,7 +248,6 @@ async def paper_session(session_id: str):
 # ==================== TTS / 语音识别 ====================
 @app.post("/api/tts")
 async def tts(req: TTSRequest):
-    """返回TTS配置（前端调用浏览器API播放）"""
     return {
         "code": 0,
         "data": {
@@ -231,7 +261,6 @@ async def tts(req: TTSRequest):
 @app.get("/api/vocab/random")
 async def random_vocab(level: str = "CET4", category: str = "",
                         count: int = 10):
-    """随机获取词汇，支持按分类筛选"""
     sql = "SELECT word, phonetic, meaning, level, topic, category FROM vocabulary WHERE level=?"
     params = [level]
     if category:
@@ -252,7 +281,6 @@ async def random_vocab(level: str = "CET4", category: str = "",
 
 @app.get("/api/vocab/categories")
 async def vocab_categories():
-    """获取词汇分类统计"""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT category, COUNT(*) FROM vocabulary GROUP BY category"
