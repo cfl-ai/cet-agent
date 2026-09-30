@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>四六级AI备考助手</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, "PingFang SC", sans-serif;
+       background: #f5f7fa; color: #2d3748; }
+.container { max-width: 960px; margin: 0 auto; padding: 16px; }
+header { background: linear-gradient(135deg, #4299e1, #3182ce);
+         color: white; padding: 24px; border-radius: 12px; margin-bottom: 16px; }
+header h1 { font-size: 22px; margin-bottom: 4px; }
+header p { font-size: 13px; opacity: 0.9; }
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; overflow-x: auto; padding-bottom: 4px; }
+.tab { padding: 8px 14px; background: white; border: none; border-radius: 8px;
+       cursor: pointer; white-space: nowrap; font-size: 13px; transition: all 0.2s; }
+.tab.active { background: #3182ce; color: white; }
+.panel { display: none; background: white; border-radius: 12px;
+         padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.panel.active { display: block; }
+.btn { padding: 10px 18px; background: #3182ce; color: white; border: none;
+       border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+.btn:hover { background: #2c5aa0; }
+.btn.secondary { background: #e2e8f0; color: #2d3748; }
+.btn.warning { background: #ed8936; }
+.btn.danger { background: #e53e3e; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.card { border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+.card h3 { font-size: 15px; margin-bottom: 8px; color: #4a5568; }
+.q-content { font-size: 15px; line-height: 1.7; margin-bottom: 12px; white-space: pre-wrap; }
+.option { padding: 10px 14px; border: 1px solid #e2e8f0; border-radius: 6px;
+          margin-bottom: 8px; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+.option:hover { background: #ebf8ff; border-color: #90caf9; }
+.option.selected { background: #3182ce; color: white; border-color: #3182ce; }
+.option.correct { background: #48bb78; color: white; border-color: #48bb78; }
+.option.wrong { background: #f56565; color: white; border-color: #f56565; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+             gap: 12px; margin-bottom: 16px; }
+.stat { background: #f7fafc; border-radius: 8px; padding: 14px; text-align: center; }
+.stat .value { font-size: 22px; font-weight: 700; color: #3182ce; }
+.stat .label { font-size: 12px; color: #718096; margin-top: 4px; }
+.loading { text-align: center; padding: 20px; color: #718096; }
+.input { width: 100%; padding: 10px 14px; border: 1px solid #e2e8f0;
+         border-radius: 8px; font-size: 14px; margin-bottom: 12px; font-family: inherit; }
+textarea.input { min-height: 120px; resize: vertical; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px;
+         font-size: 11px; background: #ebf8ff; color: #2b6cb0; margin-right: 6px; }
+.timer { font-size: 22px; font-weight: 700; color: #e53e3e; text-align: center;
+         padding: 12px; background: #fff5f5; border-radius: 8px; margin-bottom: 16px; }
+.timer.warning { color: #dd6b20; background: #fffaf0; }
+.timer.danger { color: #e53e3e; background: #fff5f5; animation: pulse 1s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+select.input { width: auto; min-width: 120px; margin-bottom: 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🎓 四六级AI备考助手</h1>
+    <p>单词复习 · 专项训练 · 真题演练 · 错题本 · 学情诊断 · AI工具箱</p>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="vocab">📚 单词复习</button>
+    <button class="tab" data-tab="practice">📝 专项训练</button>
+    <button class="tab" data-tab="paper">📋 真题演练</button>
+    <button class="tab" data-tab="wrong">❌ 错题本</button>
+    <button class="tab" data-tab="diagnose">📊 学情诊断</button>
+    <button class="tab" data-tab="tools">🛠️ AI工具箱</button>
+  </div>
+
+  <!-- ========== 1. 单词复习 ========== -->
+  <div class="panel active" id="vocab">
+    <div class="btn-row">
+      <select class="input" id="vocab-level">
+        <option value="CET4">四级</option>
+        <option value="CET6">六级</option>
+      </select>
+      <select class="input" id="vocab-category">
+        <option value="">全部分类</option>
+        <option value="高频">🔥 高频</option>
+        <option value="常考">📌 常考</option>
+        <option value="日常">💬 日常</option>
+        <option value="少见">📖 少见</option>
+      </select>
+      <select class="input" id="vocab-count">
+        <option value="10">10词</option>
+        <option value="20">20词</option>
+        <option value="30">30词</option>
+      </select>
+      <button class="btn" onclick="loadVocab()">开始复习</button>
+    </div>
+    <div id="vocab-area"></div>
+  </div>
+
+  <!-- ========== 2. 专项训练 ========== -->
+  <div class="panel" id="practice">
+    <div class="btn-row">
+      <select class="input" id="qtype">
+        <option value="writing">📝 写作 Writing</option>
+        <option value="listening_news">🎧 听力 - 短篇新闻</option>
+        <option value="listening_conversation">🎧 听力 - 长对话</option>
+        <option value="listening_passage">🎧 听力 - 听力篇章</option>
+        <option value="reading_selection">📖 阅读 - 选词填空</option>
+        <option value="reading_matching">📖 阅读 - 长篇匹配</option>
+        <option value="reading_careful" selected>📖 阅读 - 仔细阅读</option>
+        <option value="translation">🔄 翻译 - 汉译英</option>
+        <option value="comprehensive">🎯 综合训练</option>
+      </select>
+      <select class="input" id="qdiff">
+        <option value="2">基础</option>
+        <option value="3" selected>中等</option>
+        <option value="4">较难</option>
+        <option value="5">挑战</option>
+      </select>
+      <select class="input" id="qcount">
+        <option value="1">1题</option>
+        <option value="2">2题</option>
+        <option value="3" selected>3题</option>
+        <option value="5">5题</option>
+      </select>
+      <button class="btn" onclick="startExam()">生成题目</button>
+    </div>
+    <p style="font-size:12px;color:#a0aec0;margin-bottom:12px;">
+      💡 专项训练不限时间，可反复练习
+    </p>
+    <div id="exam-area">
+      <p style="color:#718096;font-size:14px;">选择题型后点击"生成题目"</p>
+    </div>
+  </div>
+
+  <!-- ========== 3. 真题演练 ========== -->
+  <div class="panel" id="paper">
+    <div class="btn-row">
+      <select class="input" id="paper-level">
+        <option value="cet4">四级</option>
+        <option value="cet6">六级</option>
+      </select>
+      <select class="input" id="paper-year">
+        <option value="2024">2024年</option>
+        <option value="2023">2023年</option>
+        <option value="2022">2022年</option>
+        <option value="2021">2021年</option>
+      </select>
+      <select class="input" id="paper-month">
+        <option value="6">6月</option>
+        <option value="12">12月</option>
+      </select>
+      <select class="input" id="paper-set">
+        <option value="1">第1套</option>
+        <option value="2">第2套</option>
+        <option value="3">第3套</option>
+      </select>
+      <button class="btn danger" onclick="startPaper()">开始真题演练</button>
+    </div>
+    <p style="font-size:12px;color:#a0aec0;margin-bottom:12px;">
+      ⏱️ 四级 125 分钟 / 六级 130 分钟，到点自动交卷
+    </p>
+    <div id="paper-area">
+      <p style="color:#718096;font-size:14px;">选择年份和月份后开始演练</p>
+    </div>
+  </div>
+
+  <!-- ========== 4. 错题本 ========== -->
+  <div class="panel" id="wrong">
+    <div class="btn-row">
+      <button class="btn" onclick="loadWrong()">刷新错题</button>
+      <button class="btn warning" onclick="generateWrongExam()">
+        🎯 基于错题生成变式题
+      </button>
+    </div>
+    <div id="wrong-area"></div>
+  </div>
+
+  <!-- ========== 5. 学情诊断 ========== -->
+  <div class="panel" id="diagnose">
+    <button class="btn" onclick="loadDiagnose()">查看诊断报告</button>
+    <div id="diagnose-area" style="margin-top:16px;"></div>
+  </div>
+
+  <!-- ========== 6. AI工具箱 ========== -->
+  <div class="panel" id="tools">
+    <div class="card">
+      <h3>🌐 联网深度检索</h3>
+      <input class="input" id="research-input" placeholder="输入查询">
+      <button class="btn" onclick="doResearch()">检索</button>
+      <div id="research-result" style="margin-top:12px;"></div>
+    </div>
+    <div class="card">
+      <h3>🖼️ 文生图</h3>
+      <input class="input" id="image-input" placeholder="描述图片内容">
+      <button class="btn" onclick="doImage()">生成图片</button>
+      <div id="image-result" style="margin-top:12px;"></div>
+    </div>
+    <div class="card">
+      <h3>🌍 多语种翻译</h3>
+      <textarea class="input" id="trans-input" placeholder="输入待翻译文本"></textarea>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <select class="input" id="src-lang">
+          <option value="zh">中文</option><option value="en">英语</option>
+        </select>
+        <span style="padding:10px;">→</span>
+        <select class="input" id="tgt-lang">
+          <option value="en">英语</option><option value="zh">中文</option>
+        </select>
+      </div>
+      <button class="btn" onclick="doTranslate()">翻译</button>
+      <div id="trans-result" style="margin-top:12px;"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
