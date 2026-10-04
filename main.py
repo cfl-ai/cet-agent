@@ -36,12 +36,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.ENABLE_TRACING:
+    # ★ 用 getattr 兜底，避免 config 缺字段导致服务崩溃
+    if getattr(settings, "ENABLE_TRACING", True):
         try:
             setup_telemetry(app)
         except Exception as e:
             logger.warning(f"Telemetry 初始化失败: {e}")
-
     await init_db()
     await seed_if_empty()
 
