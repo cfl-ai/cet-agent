@@ -22,7 +22,7 @@ const AUDIO_SUPPORT = (() => {
 
 console.log('🔊 音频环境:', AUDIO_SUPPORT);
 
-// 页面提示：微信环境不支持内置 TTS
+// 微信环境提示
 if (AUDIO_SUPPORT.isWechat) {
   document.addEventListener('DOMContentLoaded', () => {
     const bar = document.getElementById('status-bar');
@@ -50,6 +50,57 @@ let paperSession = null;
 let paperTimer = null;
 let serverTTSAvailable = false;
 
+// ==================== 工具函数 ====================
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
+
+// ★ 安全渲染任意字段（对象/数组/字符串）
+function formatField(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) {
+    return v.map(item => formatField(item)).join('；');
+  }
+  if (typeof v === 'object') {
+    const labelMap = {
+      'frequency': '频率', 'duration': '时长', 'method': '方法',
+      'material': '材料', 'steps': '步骤', 'goal': '目标',
+      'content': '内容', 'example': '示例', 'task': '任务',
+      'amount': '数量', 'time': '时间'
+    };
+    return Object.entries(v)
+      .map(([k, val]) => {
+        const label = labelMap[k] || k;
+        return `${label}: ${formatField(val)}`;
+      })
+      .join('；');
+  }
+  return String(v);
+}
+
+// Toast 提示
+function showToast(msg, duration = 2000) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = `
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.8); color: white; padding: 10px 20px;
+    border-radius: 8px; font-size: 14px; z-index: 9999;
+    max-width: 80%; text-align: center; word-break: break-word;
+  `;
+  document.body.appendChild(t);
+  if (duration > 0) setTimeout(() => t.remove(), duration);
+  return t;
+}
+
+function hideToast(t) {
+  if (t && t.parentNode) t.remove();
+}
+
 // ==================== 健康检查 ====================
 async function checkHealth() {
   try {
@@ -70,13 +121,13 @@ async function checkHealth() {
 checkHealth();
 setInterval(checkHealth, 30000);
 
-// ==================== 统一 TTS 播放入口 ====================
-let _currentAudio = null;   // 复用 audio 对象
+// ==================== TTS ====================
+let _currentAudio = null;
 
 async function speakText(text, lang = 'en-US', rate = 0.9) {
   if (!text) return;
 
-  // ★ 策略 1：桌面浏览器 → 用 speechSynthesis（零延迟）
+  // 桌面浏览器 → 用 speechSynthesis（零延迟）
   if (AUDIO_SUPPORT.hasSpeech && !AUDIO_SUPPORT.isWechat && !AUDIO_SUPPORT.isMobile) {
     try {
       window.speechSynthesis.cancel();
@@ -94,12 +145,11 @@ async function speakText(text, lang = 'en-US', rate = 0.9) {
     }
   }
 
-  // ★ 策略 2：移动端/微信 → 用服务端 TTS
+  // 移动端/微信 → 用服务端 TTS
   await speakViaServer(text, lang);
 }
 
 async function speakViaServer(text, lang) {
-  // 显示加载提示
   const toast = showToast('🔊 语音加载中...');
 
   try {
@@ -117,7 +167,6 @@ async function speakViaServer(text, lang) {
       return;
     }
 
-    // 用 HTMLAudioElement 播放（手机浏览器兼容性好）
     playAudioUrl(data.data.url);
   } catch (e) {
     hideToast(toast);
@@ -139,10 +188,8 @@ function playAudioUrl(url) {
     if (playPromise && playPromise.catch) {
       playPromise.catch(err => {
         console.error('音频播放失败:', err);
-        // iOS 浏览器需要用户手势，提供手动播放提示
         if (AUDIO_SUPPORT.isIOS) {
           showToast('⚠️ iOS 需点击页面后才能播放，请点击"🔊 重播"', 4000);
-          // 提供重播按钮
           showReplayButton(url);
         } else {
           showToast('❌ 播放失败：' + err.message, 3000);
@@ -155,7 +202,6 @@ function playAudioUrl(url) {
 }
 
 function showReplayButton(url) {
-  // 移除旧按钮
   const old = document.getElementById('replay-btn');
   if (old) old.remove();
 
@@ -173,27 +219,7 @@ function showReplayButton(url) {
     btn.remove();
   };
   document.body.appendChild(btn);
-  // 5秒后自动移除
   setTimeout(() => btn.remove(), 5000);
-}
-
-// Toast 提示
-function showToast(msg, duration = 2000) {
-  const t = document.createElement('div');
-  t.textContent = msg;
-  t.style.cssText = `
-    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
-    background: rgba(0,0,0,0.8); color: white; padding: 10px 20px;
-    border-radius: 8px; font-size: 14px; z-index: 9999;
-    max-width: 80%; text-align: center; word-break: break-word;
-  `;
-  document.body.appendChild(t);
-  if (duration > 0) setTimeout(() => t.remove(), duration);
-  return t;
-}
-
-function hideToast(t) {
-  if (t && t.parentNode) t.remove();
 }
 
 // ==================== 1. 单词复习 ====================
@@ -562,135 +588,7 @@ async function loadDiagnose() {
   `;
 }
 
-// ==================== 6. 智能助手 ====================
-async function sendChat() {
-  const input = document.getElementById('chat-input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-
-  const box = document.getElementById('chat-box');
-  box.insertAdjacentHTML('beforeend',
-    `<div class="chat-msg user">${escapeHtml(text)}</div>`);
-  box.insertAdjacentHTML('beforeend',
-    `<div class="chat-msg sys">🤔 正在规划...</div>`);
-  box.scrollTop = box.scrollHeight;
-
-  try {
-    const resp = await fetch('/api/agent/run', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({user_request: text, user_id: USER_ID, max_iterations: 3})
-    });
-    const data = await resp.json();
-    box.querySelectorAll('.chat-msg.sys').forEach(el => el.remove());
-
-    if (data.code !== 0) {
-      box.insertAdjacentHTML('beforeend',
-        `<div class="chat-msg bot">❌ ${escapeHtml(data.detail || '请求失败')}</div>`);
-    } else {
-      const d = data.data;
-      const msgs = (d.messages || []).filter(m => m).slice(-5);
-      const intent = d.intent || 'unknown';
-      box.insertAdjacentHTML('beforeend',
-        `<div class="chat-msg sys">🎯 识别意图：${intent} | 迭代 ${d.iterations} 轮</div>`);
-      const summary = msgs.length
-        ? msgs.join('\n')
-        : (d.result?.content || JSON.stringify(d.result || {}).slice(0, 300));
-      box.insertAdjacentHTML('beforeend',
-        `<div class="chat-msg bot">${escapeHtml(summary)}</div>`);
-    }
-  } catch (e) {
-    box.querySelectorAll('.chat-msg.sys').forEach(el => el.remove());
-    box.insertAdjacentHTML('beforeend',
-      `<div class="chat-msg bot">❌ ${escapeHtml(e.message)}</div>`);
-  }
-  box.scrollTop = box.scrollHeight;
-}
-
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, c => (
-    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
-  ));
-}
-
-// ==================== 7. AI工具箱 ====================
-async function doResearch() {
-  const q = document.getElementById('research-input').value.trim();
-  if (!q) return;
-  const area = document.getElementById('research-result');
-  area.innerHTML = '<div class="loading">检索中...</div>';
-  const resp = await fetch('/api/research?query=' + encodeURIComponent(q), {method: 'POST'});
-  const data = await resp.json();
-  area.innerHTML = data.code === 0
-    ? `<div style="padding:12px;background:#f7fafc;border-radius:8px;">${data.data.summary}</div>`
-    : '<p style="color:#f56565;">检索失败</p>';
-}
-
-async function doImage() {
-  const p = document.getElementById('image-input').value.trim();
-  if (!p) return;
-  const area = document.getElementById('image-result');
-  area.innerHTML = '<div class="loading">生成中...</div>';
-  const resp = await fetch('/api/content/generate', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({prompt: p, content_type: 'image'})
-  });
-  const data = await resp.json();
-  area.innerHTML = data.code === 0
-    ? `<img src="${data.data.url}" style="max-width:100%;border-radius:8px;">`
-    : '<p style="color:#f56565;">生成失败</p>';
-}
-
-async function doSimilarSearch() {
-  const q = document.getElementById('similar-input').value.trim();
-  if (!q) return;
-  const area = document.getElementById('similar-result');
-  area.innerHTML = '<div class="loading">检索中...</div>';
-  const resp = await fetch('/api/vector/similar', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({query: q, k: 5})
-  });
-  const data = await resp.json();
-  if (data.code !== 0) { area.innerHTML = '<p style="color:#f56565;">检索失败</p>'; return; }
-  const items = data.data.results || [];
-  if (!items.length) {
-    area.innerHTML = '<p style="color:#718096;">未找到相似题</p>';
-    return;
-  }
-  area.innerHTML = items.map((r, i) => `
-    <div style="padding:10px;background:#f7fafc;border-radius:6px;margin-bottom:8px;font-size:13px;">
-      <strong>#${i+1}</strong> 相似度：${(1 - r.distance).toFixed(3)}<br>
-      ${escapeHtml(r.content.slice(0, 200))}
-    </div>
-  `).join('');
-}
-
-async function doTranslate() {
-  const text = document.getElementById('trans-input').value.trim();
-  if (!text) return;
-  const area = document.getElementById('trans-result');
-  area.innerHTML = '<div class="loading">翻译中...</div>';
-  const resp = await fetch('/api/translate', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      text,
-      source_lang: document.getElementById('src-lang').value,
-      target_lang: document.getElementById('tgt-lang').value
-    })
-  });
-  const data = await resp.json();
-  area.innerHTML = data.success
-    ? `<div style="padding:12px;background:#f7fafc;border-radius:8px;">${data.translation}</div>`
-    : '<p style="color:#f56565;">翻译失败</p>';
-}
-
-// 预加载语音列表
-if (window.speechSynthesis) {
-  window.speechSynthesis.getVoices();
-  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
-}
-// ==================== 学情预测与学习方案 ====================
+// ==================== 6. 学情预测与学习方案 ====================
 let studyPlanGenerated = false;
 
 async function generateStudyPlan() {
@@ -777,16 +675,16 @@ function renderStudyPlan(area, data) {
     <div class="card">
       <h3>🔍 学情诊断</h3>
       <p style="font-size:14px;line-height:1.7;margin-top:8px;">
-        <strong>水平定位：</strong>${escapeHtml(p.analysis.current_level)}
+        <strong>水平定位：</strong>${escapeHtml(formatField(p.analysis.current_level))}
       </p>
       <p style="font-size:14px;line-height:1.7;margin-top:8px;">
-        <strong>差距分析：</strong>${escapeHtml(p.analysis.gap_analysis)}
+        <strong>差距分析：</strong>${escapeHtml(formatField(p.analysis.gap_analysis))}
       </p>
       <div style="margin-top:12px;">
         <strong style="font-size:14px;">关键问题：</strong>
         ${(p.analysis.key_issues || []).map((issue, i) => `
           <div style="padding:8px 12px;background:#fff5f5;border-radius:6px;margin-top:8px;font-size:13px;">
-            <strong>${i+1}.</strong> ${escapeHtml(issue)}
+            <strong>${i+1}.</strong> ${escapeHtml(formatField(issue))}
           </div>
         `).join('')}
       </div>
@@ -799,13 +697,13 @@ function renderStudyPlan(area, data) {
       ${(p.methods || []).map((m, i) => `
         <div style="padding:12px;background:#f7fafc;border-radius:8px;margin-top:12px;">
           <h4 style="font-size:14px;color:#2b6cb0;margin-bottom:8px;">
-            ${i+1}. ${escapeHtml(m.name)}
+            ${i+1}. ${escapeHtml(formatField(m.name))}
           </h4>
           <p style="font-size:13px;color:#4a5568;line-height:1.7;">
-            <strong>为什么适合你：</strong>${escapeHtml(m.why)}
+            <strong>为什么适合你：</strong>${escapeHtml(formatField(m.why))}
           </p>
           <p style="font-size:13px;color:#4a5568;line-height:1.7;margin-top:6px;">
-            <strong>具体操作：</strong>${escapeHtml(m.how)}
+            <strong>具体操作：</strong>${escapeHtml(formatField(m.how))}
           </p>
         </div>
       `).join('')}
@@ -818,10 +716,10 @@ function renderStudyPlan(area, data) {
       ${(p.tips || []).map(t => `
         <div style="padding:10px 0;border-bottom:1px solid #e2e8f0;">
           <p style="font-size:14px;font-weight:600;color:#2d3748;margin-bottom:4px;">
-            ${escapeHtml(t.topic)}
+            ${escapeHtml(formatField(t.topic))}
           </p>
           <p style="font-size:13px;color:#4a5568;line-height:1.7;">
-            ${escapeHtml(t.content)}
+            ${escapeHtml(formatField(t.content))}
           </p>
         </div>
       `).join('')}
@@ -840,14 +738,14 @@ function renderStudyPlan(area, data) {
           <div style="padding:14px;background:${phaseColors[idx]};border-radius:8px;margin-top:12px;">
             <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
               <h4 style="font-size:15px;color:#2d3748;">
-                ${escapeHtml(phase.name)}
+                ${escapeHtml(formatField(phase.name))}
               </h4>
               <span class="badge" style="font-size:12px;">
                 ${phase.duration_days} 天
               </span>
             </div>
             <p style="font-size:13px;color:#4a5568;margin-top:6px;">
-              <strong>重点：</strong>${escapeHtml(phase.focus || '')}
+              <strong>重点：</strong>${escapeHtml(formatField(phase.focus || ''))}
             </p>
             ${(phase.daily_tasks || []).length ? `
               <div style="margin-top:10px;">
@@ -855,11 +753,11 @@ function renderStudyPlan(area, data) {
                 ${phase.daily_tasks.map(t => `
                   <div style="padding:8px 12px;background:white;border-radius:6px;margin-top:8px;font-size:13px;">
                     <div style="display:flex;justify-content:space-between;flex-wrap:wrap;">
-                      <strong>${escapeHtml(t.task)}</strong>
-                      <span style="color:#3182ce;">${escapeHtml(t.amount)}</span>
+                      <strong>${escapeHtml(formatField(t.task))}</strong>
+                      <span style="color:#3182ce;">${escapeHtml(formatField(t.amount))}</span>
                     </div>
                     <p style="color:#718096;margin-top:4px;font-size:12px;">
-                      目标：${escapeHtml(t.goal || '')}
+                      目标：${escapeHtml(formatField(t.goal || ''))}
                     </p>
                   </div>
                 `).join('')}
@@ -880,7 +778,7 @@ function renderStudyPlan(area, data) {
             第 ${m.day} 天
           </div>
           <div style="flex:1;font-size:13px;color:#4a5568;line-height:1.7;">
-            ${escapeHtml(m.target)}
+            ${escapeHtml(formatField(m.target))}
           </div>
         </div>
       `).join('')}
@@ -909,34 +807,34 @@ function copyStudyPlan() {
   if (!p) return;
 
   let text = '【学情诊断】\n';
-  text += `水平定位：${p.analysis.current_level}\n`;
-  text += `差距分析：${p.analysis.gap_analysis}\n`;
-  text += `关键问题：\n${(p.analysis.key_issues || []).map((x,i)=>`  ${i+1}. ${x}`).join('\n')}\n\n`;
+  text += `水平定位：${formatField(p.analysis.current_level)}\n`;
+  text += `差距分析：${formatField(p.analysis.gap_analysis)}\n`;
+  text += `关键问题：\n${(p.analysis.key_issues || []).map((x,i)=>`  ${i+1}. ${formatField(x)}`).join('\n')}\n\n`;
 
   text += '【推荐学习方法】\n';
   (p.methods || []).forEach((m, i) => {
-    text += `${i+1}. ${m.name}\n   为什么：${m.why}\n   怎么做：${m.how}\n`;
+    text += `${i+1}. ${formatField(m.name)}\n   为什么：${formatField(m.why)}\n   怎么做：${formatField(m.how)}\n`;
   });
 
   text += '\n【应试技巧】\n';
   (p.tips || []).forEach(t => {
-    text += `· ${t.topic}：${t.content}\n`;
+    text += `· ${formatField(t.topic)}：${formatField(t.content)}\n`;
   });
 
   text += '\n【分阶段计划】\n';
   ['phase_1', 'phase_2', 'phase_3'].forEach(key => {
     const phase = p.study_plan && p.study_plan[key];
     if (!phase) return;
-    text += `\n▶ ${phase.name}（${phase.duration_days}天）\n`;
-    text += `  重点：${phase.focus}\n`;
+    text += `\n▶ ${formatField(phase.name)}（${phase.duration_days}天）\n`;
+    text += `  重点：${formatField(phase.focus)}\n`;
     (phase.daily_tasks || []).forEach(t => {
-      text += `  · ${t.task} | ${t.amount} | 目标：${t.goal}\n`;
+      text += `  · ${formatField(t.task)} | ${formatField(t.amount)} | 目标：${formatField(t.goal)}\n`;
     });
   });
 
   text += '\n【里程碑】\n';
   (p.milestones || []).forEach(m => {
-    text += `第 ${m.day} 天：${m.target}\n`;
+    text += `第 ${m.day} 天：${formatField(m.target)}\n`;
   });
 
   navigator.clipboard.writeText(text).then(() => {
@@ -944,4 +842,147 @@ function copyStudyPlan() {
   }).catch(() => {
     alert('复制失败，请手动选择文本');
   });
+}
+
+// ==================== 7. 智能助手 ====================
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+
+  const box = document.getElementById('chat-box');
+  box.insertAdjacentHTML('beforeend',
+    `<div class="chat-msg user">${escapeHtml(text)}</div>`);
+  box.insertAdjacentHTML('beforeend',
+    `<div class="chat-msg sys">🤔 正在规划...</div>`);
+  box.scrollTop = box.scrollHeight;
+
+  try {
+    const resp = await fetch('/api/agent/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_request: text, user_id: USER_ID, max_iterations: 3})
+    });
+    const data = await resp.json();
+    box.querySelectorAll('.chat-msg.sys').forEach(el => el.remove());
+
+    if (data.code !== 0) {
+      box.insertAdjacentHTML('beforeend',
+        `<div class="chat-msg bot">❌ ${escapeHtml(data.detail || '请求失败')}</div>`);
+    } else {
+      const d = data.data;
+      const intent = d.intent || 'unknown';
+
+      // 显示执行过程
+      const intentLabel = {
+        'generate_question': '📝 生成题目',
+        'generate_from_wrong': '🔄 错题变式题',
+        'diagnose': '📊 学情诊断',
+        'chat': '💬 对话',
+        'done': '✅ 完成'
+      }[intent] || intent;
+
+      box.insertAdjacentHTML('beforeend',
+        `<div class="chat-msg sys">🎯 ${intentLabel} | 共执行 ${d.iterations} 轮</div>`);
+
+      // 显示执行结果
+      const summary = (d.messages || []).filter(m => m && String(m).trim()).join('\n');
+      if (summary) {
+        box.insertAdjacentHTML('beforeend',
+          `<div class="chat-msg bot">${escapeHtml(summary)}</div>`);
+      } else if (d.result && d.result.content) {
+        box.insertAdjacentHTML('beforeend',
+          `<div class="chat-msg bot">${escapeHtml(d.result.content)}</div>`);
+      }
+
+      // 如果生成了题目，提示用户去"专项训练"查看
+      if (intent === 'generate_question' || intent === 'generate_from_wrong') {
+        box.insertAdjacentHTML('beforeend',
+          `<div class="chat-msg sys">💡 题目已生成，请点击上方「📝 专项训练」查看</div>`);
+      }
+    }
+  } catch (e) {
+    box.querySelectorAll('.chat-msg.sys').forEach(el => el.remove());
+    box.insertAdjacentHTML('beforeend',
+      `<div class="chat-msg bot">❌ ${escapeHtml(e.message)}</div>`);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+// ==================== 8. AI工具箱 ====================
+async function doResearch() {
+  const q = document.getElementById('research-input').value.trim();
+  if (!q) return;
+  const area = document.getElementById('research-result');
+  area.innerHTML = '<div class="loading">检索中...</div>';
+  const resp = await fetch('/api/research?query=' + encodeURIComponent(q), {method: 'POST'});
+  const data = await resp.json();
+  area.innerHTML = data.code === 0
+    ? `<div style="padding:12px;background:#f7fafc;border-radius:8px;">${escapeHtml(data.data.summary)}</div>`
+    : '<p style="color:#f56565;">检索失败</p>';
+}
+
+async function doImage() {
+  const p = document.getElementById('image-input').value.trim();
+  if (!p) return;
+  const area = document.getElementById('image-result');
+  area.innerHTML = '<div class="loading">生成中...</div>';
+  const resp = await fetch('/api/content/generate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({prompt: p, content_type: 'image'})
+  });
+  const data = await resp.json();
+  area.innerHTML = data.code === 0
+    ? `<img src="${data.data.url}" style="max-width:100%;border-radius:8px;">`
+    : '<p style="color:#f56565;">生成失败</p>';
+}
+
+async function doSimilarSearch() {
+  const q = document.getElementById('similar-input').value.trim();
+  if (!q) return;
+  const area = document.getElementById('similar-result');
+  area.innerHTML = '<div class="loading">检索中...</div>';
+  const resp = await fetch('/api/vector/similar', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({query: q, k: 5})
+  });
+  const data = await resp.json();
+  if (data.code !== 0) { area.innerHTML = '<p style="color:#f56565;">检索失败</p>'; return; }
+  const items = data.data.results || [];
+  if (!items.length) {
+    area.innerHTML = '<p style="color:#718096;">未找到相似题</p>';
+    return;
+  }
+  area.innerHTML = items.map((r, i) => `
+    <div style="padding:10px;background:#f7fafc;border-radius:6px;margin-bottom:8px;font-size:13px;">
+      <strong>#${i+1}</strong> 相似度：${(1 - r.distance).toFixed(3)}<br>
+      ${escapeHtml((r.content || '').slice(0, 200))}
+    </div>
+  `).join('');
+}
+
+async function doTranslate() {
+  const text = document.getElementById('trans-input').value.trim();
+  if (!text) return;
+  const area = document.getElementById('trans-result');
+  area.innerHTML = '<div class="loading">翻译中...</div>';
+  const resp = await fetch('/api/translate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      text,
+      source_lang: document.getElementById('src-lang').value,
+      target_lang: document.getElementById('tgt-lang').value
+    })
+  });
+  const data = await resp.json();
+  area.innerHTML = data.success
+    ? `<div style="padding:12px;background:#f7fafc;border-radius:8px;">${escapeHtml(data.translation)}</div>`
+    : '<p style="color:#f56565;">翻译失败</p>';
+}
+
+// 预加载语音列表
+if (window.speechSynthesis) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
 }
