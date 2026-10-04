@@ -1,186 +1,147 @@
 """
-基于 LangGraph 的智能规划层
-把用户的自然语言请求路由到合适的 Agent，支持多步协作。
-未装 LangGraph 时优雅降级。
+可观测性模块 — OpenTelemetry 集成（带优雅降级）
+未装 OTel 或初始化失败时，所有 tracing 退化为 no-op。
 """
+import os
 import logging
-import time
-from typing import TypedDict, Annotated
-import operator
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-_AVAILABLE = False
+# ---- 统一在顶部尝试导入所有 OTel 相关包 ----
+_OTEL_AVAILABLE = False
+_ENABLED = False
+tracer = None
+
+_OTLP_AVAILABLE = False
+_FASTAPI_INSTR_AVAILABLE = False
+_HTTPX_INSTR_AVAILABLE = False
+
 try:
-    from langgraph.graph import StateGraph, END
-    _AVAILABLE = True
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor, ConsoleSpanExporter,
+    )
+    from opentelemetry.sdk.resources import Resource
+    _OTEL_AVAILABLE = True
 except ImportError:
-    logger.info("[GraphOrchestrator] LangGraph 未安装，智能规划禁用")
+    logger.info("[Telemetry] OpenTelemetry 核心未安装，追踪功能禁用")
+
+try:
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+        OTLPSpanExporter,
+    )
+    _OTLP_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    _FASTAPI_INSTR_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    _HTTPX_INSTR_AVAILABLE = True
+except ImportError:
+    pass
 
 
-class AgentState(TypedDict, total=False):
-    user_request: str
-    intent: str
-    params: dict
-    result: dict
-    messages: Annotated[list, operator.add]
-    iterations: int
-    max_iterations: int
+class _NoOpSpan:
+    """OTel 不可用时的占位 span"""
+    def set_attribute(self, *a, **kw): pass
+    def record_exception(self, *a, **kw): pass
+    def set_status(self, *a, **kw): pass
+    def add_event(self, *a, **kw): pass
 
 
-def build_graph(orchestrator, llm_client):
-    """构建 LangGraph 状态图"""
-    if not _AVAILABLE:
-        return None
+def setup_telemetry(app=None) -> bool:
+    """初始化 OTel，在 FastAPI 启动时调用"""
+    global _ENABLED, tracer
 
-    async def router_node(state: AgentState):
-        """LLM 解析意图"""
-        iterations = state.get("iterations", 0) + 1
-        prompt = f"""分析用户请求，输出意图标签。
+    if not _OTEL_AVAILABLE:
+        return False
 
-可选意图：
-- generate_question: 生成题目（练习）
-- generate_from_wrong: 基于错题生成变式题
-- diagnose: 学情诊断
-- research: 联网检索
-- translate: 翻译
-- chat: 一般性对话（无明确任务）
-- done: 任务已完成，无需继续
+    try:
+        resource = Resource.create({
+            "service.name": "cet-agent",
+            "service.version": "1.0.0",
+            "deployment.environment": os.getenv("ENV", "production"),
+        })
 
-用户请求：{state['user_request']}
+        provider = TracerProvider(resource=resource)
 
-已执行轮次：{iterations}
-如果已执行 ≥3 轮或任务明显已完成，输出 done。
-只输出一个意图标签，不要任何解释。"""
-
-        try:
-            intent = await llm_client.chat(
-                [{"role": "user", "content": prompt}],
-                temperature=0.2, max_tokens=50,
-            )
-            intent = intent.strip().lower().split()[0] if intent.strip() else "chat"
-            for valid in ["generate_question", "generate_from_wrong",
-                          "diagnose", "research", "translate", "chat", "done"]:
-                if valid in intent:
-                    intent = valid
-                    break
+        otel_endpoint = os.getenv("OTEL_ENDPOINT", "")
+        if otel_endpoint and _OTLP_AVAILABLE:
+            try:
+                exporter = OTLPSpanExporter(endpoint=otel_endpoint, insecure=True)
+                provider.add_span_processor(BatchSpanProcessor(exporter))
+                logger.info(f"[Telemetry] OTLP 导出到 {otel_endpoint}")
+            except Exception as e:
+                logger.warning(f"[Telemetry] OTLP 导出失败，回退控制台：{e}")
+                provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+        else:
+            provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+            if otel_endpoint:
+                logger.info("[Telemetry] OTLP exporter 未安装，追踪输出到控制台")
             else:
-                intent = "chat"
-        except Exception as e:
-            logger.warning(f"[Router] 意图解析失败: {e}")
-            intent = "done"
+                logger.info("[Telemetry] 无 OTEL_ENDPOINT，追踪输出到控制台")
 
-        return {
-            "intent": intent,
-            "iterations": iterations,
-            "max_iterations": state.get("max_iterations", 3),
-        }
+        trace.set_tracer_provider(provider)
+        tracer = trace.get_tracer("cet-agent")
 
-    async def question_node(state: AgentState):
-        try:
-            result = await orchestrator.generate_exam({
-                "num_questions": 1,
-                "question_type": state.get("params", {}).get(
-                    "question_type", "reading_careful"
-                ),
-            })
-            return {
-                "result": result,
-                "messages": [f"✅ 生成 {result['total']} 道题"],
-            }
-        except Exception as e:
-            return {"messages": [f"❌ 出题失败: {e}"]}
+        # FastAPI 插桩（可选）
+        if app is not None and _FASTAPI_INSTR_AVAILABLE:
+            try:
+                FastAPIInstrumentor.instrument_app(app)
+                logger.info("[Telemetry] FastAPI 已插桩")
+            except Exception as e:
+                logger.warning(f"[Telemetry] FastAPI 插桩失败：{e}")
+        elif app is not None:
+            logger.info("[Telemetry] FastAPI 插桩库未安装，跳过")
 
-    async def wrong_node(state: AgentState):
-        try:
-            result = await orchestrator.generate_from_wrong(
-                state.get("params", {}).get("user_id", "anonymous"),
-                num=state.get("params", {}).get("num", 3),
-            )
-            return {
-                "result": result,
-                "messages": [f"✅ 生成 {result['total']} 道变式题"],
-            }
-        except Exception as e:
-            return {"messages": [f"❌ 变式题生成失败: {e}"]}
+        # httpx 插桩（可选）
+        if _HTTPX_INSTR_AVAILABLE:
+            try:
+                HTTPXClientInstrumentor().instrument()
+                logger.info("[Telemetry] HTTPX 已插桩")
+            except Exception as e:
+                logger.warning(f"[Telemetry] HTTPX 插桩失败：{e}")
+        else:
+            logger.info("[Telemetry] HTTPX 插桩库未安装，跳过")
 
-    async def diagnose_node(state: AgentState):
-        try:
-            result = await orchestrator.review_agent.execute(
-                {"user_id": state.get("params", {}).get("user_id", "anonymous"),
-                 "answers": []},
-                task_id=f"graph_diag_{int(time.time())}",
-            )
-            return {
-                "result": result,
-                "messages": [f"📊 预测分数: {result.get('predicted_score')}"],
-            }
-        except Exception as e:
-            return {"messages": [f"❌ 诊断失败: {e}"]}
+        _ENABLED = True
+        return True
 
-    async def chat_node(state: AgentState):
-        try:
-            reply = await llm_client.chat([
-                {"role": "system",
-                 "content": "你是四六级备考助手，用中文回答。"},
-                {"role": "user", "content": state["user_request"]},
-            ], temperature=0.7, max_tokens=300)
-            return {
-                "result": {"type": "chat", "content": reply},
-                "messages": [reply[:100]],
-            }
-        except Exception as e:
-            return {"messages": [f"❌ 对话失败: {e}"]}
-
-    def route_by_intent(state: AgentState):
-        if state.get("iterations", 0) >= state.get("max_iterations", 3):
-            return "end"
-        intent = state.get("intent", "chat")
-        if intent == "done":
-            return "end"
-        if intent == "generate_question":
-            return "question"
-        if intent == "generate_from_wrong":
-            return "wrong"
-        if intent == "diagnose":
-            return "diagnose"
-        if intent == "chat":
-            return "chat"
-        return "end"
-
-    graph = StateGraph(AgentState)
-    graph.add_node("router", router_node)
-    graph.add_node("question", question_node)
-    graph.add_node("wrong", wrong_node)
-    graph.add_node("diagnose", diagnose_node)
-    graph.add_node("chat", chat_node)
-
-    graph.set_entry_point("router")
-    graph.add_conditional_edges("router", route_by_intent, {
-        "question": "question",
-        "wrong": "wrong",
-        "diagnose": "diagnose",
-        "chat": "chat",
-        "end": END,
-    })
-
-    graph.add_edge("question", "router")
-    graph.add_edge("wrong", "router")
-    graph.add_edge("diagnose", "router")
-    graph.add_edge("chat", END)
-
-    return graph.compile()
+    except Exception as e:
+        logger.error(f"[Telemetry] 初始化失败：{e}")
+        _ENABLED = False
+        return False
 
 
-_graph_instance = None
+@contextmanager
+def trace_span(name: str, attributes: dict = None):
+    """
+    上下文管理器：OTel 可用则创建 span，否则 no-op。
+    用法：
+        with trace_span("agent.QuestionAgent", {"task_id": "xxx"}):
+            result = await do_work()
+    """
+    if not _ENABLED or tracer is None:
+        yield _NoOpSpan()
+        return
 
-
-def get_graph(orchestrator, llm_client):
-    global _graph_instance
-    if _graph_instance is None:
-        _graph_instance = build_graph(orchestrator, llm_client)
-    return _graph_instance
+    with tracer.start_as_current_span(name) as span:
+        if attributes:
+            for k, v in attributes.items():
+                try:
+                    span.set_attribute(k, v)
+                except Exception:
+                    pass
+        yield span
 
 
 def is_enabled() -> bool:
-    return _AVAILABLE
+    return _ENABLED
