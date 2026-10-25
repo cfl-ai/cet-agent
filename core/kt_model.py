@@ -85,8 +85,15 @@ class KnowledgeTracer:
                 continue
             # 最近10次答题权重更高
             recent = corrects[-10:]
-            weights = np.linspace(0.5, 1.0, len(recent))
-            mastery[skill] = float(np.average(recent, weights=weights))
+            # 单条记录时权重取满值，与实时链路首题权重一致
+            weights = (np.linspace(0.5, 1.0, len(recent))
+                       if len(recent) > 1 else np.array([1.0]))
+            # 与 grading_agent 实时链路保持同一口径的贝叶斯平滑：
+            # (加权正确数 + K·prior) / (加权总数 + K)，样本少时向先验收缩，
+            # 避免单次答题即把掌握度推到极端值。
+            w_sum = float(np.sum(weights))
+            w_correct = float(np.dot(weights, recent))
+            mastery[skill] = (w_correct + 1.0) / (w_sum + 2.0)
         return mastery
 
     async def fit_bkt(self, user_id: str = None) -> dict:

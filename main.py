@@ -28,6 +28,7 @@ from services.asr_service import asr_service
 from services.vector_service import vector_service
 from services.tts_service import tts_service, AUDIO_CACHE_DIR
 from services import user_service
+from services import analytics_service
 from core.monitor import metrics
 from core.telemetry import setup_telemetry, is_enabled as telemetry_enabled
 
@@ -166,6 +167,12 @@ class StudyPlanRequest(BaseModel):
     target_score: int | None = None
     days_left: int = 60
     level: str | None = None
+
+
+class VocabReviewRequest(BaseModel):
+    """单词复习上报 — 此前 words_reviewed 从未被写入"""
+    user_id: str
+    count: int = 1
 
 
 # ==================== 工具函数 ====================
@@ -312,6 +319,55 @@ async def update_user_profile(user_id: str, req: dict):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"更新用户档案失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 学习分析（趋势/薄弱点/打卡/模考历史） ====================
+@app.get("/api/user/{user_id}/analytics")
+async def user_analytics(user_id: str, days: int = 30):
+    """
+    学情仪表盘：档案总览 + 每日趋势 + 薄弱知识点 + 连续打卡 + 模考历史。
+    days 为趋势回溯天数，收敛到 1-90。
+    """
+    try:
+        return {"code": 0,
+                "data": await analytics_service.get_dashboard(user_id, days)}
+    except Exception as e:
+        logger.error(f"学习分析失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/user/{user_id}/weak-points")
+async def user_weak_points(user_id: str, limit: int = 5):
+    """薄弱知识点排名：掌握度升序，附未解决错题数"""
+    try:
+        limit = max(1, min(20, limit))
+        return {"code": 0,
+                "data": await analytics_service.get_weak_points(user_id, limit)}
+    except Exception as e:
+        logger.error(f"薄弱点查询失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/user/{user_id}/streak")
+async def user_streak(user_id: str):
+    """连续打卡统计（当前连续 / 历史最长 / 累计学习天数）"""
+    try:
+        return {"code": 0, "data": await analytics_service.get_streak(user_id)}
+    except Exception as e:
+        logger.error(f"打卡统计失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/user/{user_id}/exams")
+async def user_exams(user_id: str, limit: int = 20):
+    """真题模考历史（含真实用时与状态）"""
+    try:
+        limit = max(1, min(100, limit))
+        return {"code": 0,
+                "data": await analytics_service.get_exam_history(user_id, limit)}
+    except Exception as e:
+        logger.error(f"模考历史查询失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -527,6 +583,23 @@ async def vocab_categories():
         )
         rows = await cursor.fetchall()
     return {"categories": [{"name": r[0] or "高频", "count": r[1]} for r in rows]}
+
+
+@app.post("/api/vocab/review")
+async def vocab_review(req: VocabReviewRequest):
+    """
+    上报单词复习量，累加到当日 study_stats.words_reviewed。
+    此前该字段从未被写入，词汇学习在统计上是黑洞。
+    """
+    try:
+        data = await analytics_service.record_words_reviewed(
+            req.user_id, req.count)
+        return {"code": 0, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"词汇复习记录失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== 翻译/ASR/内容/检索 ====================

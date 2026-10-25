@@ -38,6 +38,11 @@ class GradingAgent(BaseAgent):
     RUSH_THRESHOLD = 5.0
     # 长时间犹豫阈值（秒）：超过此时长仍错，多为概念不清
     HESITATE_THRESHOLD = 60.0
+    # 贝叶斯平滑先验强度 K：样本越少，掌握度越向先验收缩；
+    # 样本充足时收敛到真实正确率，避免"答对1题即掌握度1.0"
+    KT_PRIOR_STRENGTH = 2.0
+    # 先验掌握概率（P(L0)）
+    KT_PRIOR = 0.5
     # 错误类型中文映射（供学习方案与前端展示）
     ERROR_TYPE_CN = {
         "vocab": "词汇欠缺",
@@ -195,7 +200,18 @@ class GradingAgent(BaseAgent):
 
     async def _update_knowledge(self, db, user_id: str, tags_json: str,
                                   correct: bool):
-        """简化版知识追踪 — 指数移动平均"""
+        """
+        知识追踪 — 贝叶斯平滑的掌握度更新。
+
+        此前为裸 EMA（mastery×0.7 + 结果×0.3），样本少时严重失真：
+        只答对1题掌握度即冲到 1.0，模拟训练中出现过 78% 正确率的用户
+        掌握度(0.90)反高于 88% 正确率用户(0.57)的倒挂。
+
+        现改为 (correct + K·prior) / (attempts + K)：
+          - 答对1题  → (1+1)/(1+2) = 0.67，不再盲目乐观
+          - 样本充足 → 收敛到该知识点的真实正确率
+        同时修复 correct 列插入后从未更新的隐性 bug。
+        """
         try:
             tags = json.loads(tags_json) if tags_json else []
         except Exception:
@@ -203,26 +219,37 @@ class GradingAgent(BaseAgent):
 
         for tag in tags:
             cursor = await db.execute(
-                "SELECT mastery, attempts FROM knowledge_state "
+                "SELECT mastery, attempts, correct FROM knowledge_state "
                 "WHERE user_id=? AND knowledge_point=?",
                 (user_id, tag)
             )
             row = await cursor.fetchone()
             if row:
-                mastery, attempts = row
-                new_mastery = mastery * 0.7 + (1.0 if correct else 0.0) * 0.3
+                _, attempts, correct_cnt = row
+                new_attempts = (attempts or 0) + 1
+                new_correct = (correct_cnt or 0) + (1 if correct else 0)
+                new_mastery = (
+                    (new_correct + self.KT_PRIOR_STRENGTH * self.KT_PRIOR)
+                    / (new_attempts + self.KT_PRIOR_STRENGTH)
+                )
                 await db.execute(
-                    "UPDATE knowledge_state SET mastery=?, attempts=attempts+1, "
-                    "last_update=? WHERE user_id=? AND knowledge_point=?",
-                    (new_mastery, time.time(), user_id, tag)
+                    "UPDATE knowledge_state SET mastery=?, attempts=?, "
+                    "correct=?, last_update=? WHERE user_id=? AND knowledge_point=?",
+                    (new_mastery, new_attempts, new_correct,
+                     time.time(), user_id, tag)
                 )
             else:
+                new_correct = 1 if correct else 0
+                new_mastery = (
+                    (new_correct + self.KT_PRIOR_STRENGTH * self.KT_PRIOR)
+                    / (1 + self.KT_PRIOR_STRENGTH)
+                )
                 await db.execute(
                     """INSERT INTO knowledge_state
                        (user_id, knowledge_point, mastery, attempts, correct, last_update)
                        VALUES (?, ?, ?, 1, ?, ?)""",
-                    (user_id, tag, 1.0 if correct else 0.0,
-                     1 if correct else 0, time.time())
+                    (user_id, tag, new_mastery,
+                     new_correct, time.time())
                 )
 
     def _infer_error_type(self, ans: dict, qtype: str = "") -> str:
