@@ -90,6 +90,19 @@ async def init_db():
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_session_user ON exam_sessions(user_id)")
 
+        # 听力音频缓存
+        # 注意：此前该表只在 scripts/migrate_db.py 中创建，
+        # 全新部署只执行 init_db 时会缺失，导致 TTS 听力功能写入失败。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS listening_assets (
+                asset_id TEXT PRIMARY KEY,
+                question_id TEXT,
+                transcript TEXT,
+                audio_url TEXT,
+                created_at REAL
+            )
+        """)
+
         # 错题本
         await db.execute("""
             CREATE TABLE IF NOT EXISTS wrong_questions (
@@ -113,7 +126,8 @@ async def init_db():
                 level TEXT,
                 frequency INTEGER DEFAULT 0,
                 topic TEXT,
-                examples TEXT
+                examples TEXT,
+                category TEXT DEFAULT '高频'
             )
         """)
 

@@ -29,3 +29,7 @@ chromadb
 # ---- 任务规划（可选：不装则自动降级）----
 langgraph
 langchain-core
+
+# ---- 开发与测试 ----
+pytest
+pytest-asyncio

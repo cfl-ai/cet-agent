@@ -6,7 +6,7 @@ import uuid
 import aiosqlite
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -27,6 +27,7 @@ from services.translate_service import translate_service
 from services.asr_service import asr_service
 from services.vector_service import vector_service
 from services.tts_service import tts_service, AUDIO_CACHE_DIR
+from services import user_service
 from core.monitor import metrics
 from core.telemetry import setup_telemetry, is_enabled as telemetry_enabled
 
@@ -71,6 +72,42 @@ research_agent = ResearchAgent()
 study_plan_agent = StudyPlanAgent()
 
 
+# ==================== 管理接口鉴权 ====================
+async def require_admin(x_admin_token: str = Header(default=None)):
+    """
+    管理接口统一鉴权。
+    - 服务端未配置 ADMIN_TOKEN 时直接拒绝，避免接口裸奔
+    - 令牌不匹配返回 401
+    """
+    if not settings.ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="服务端未配置 ADMIN_TOKEN，管理接口已禁用"
+        )
+    if x_admin_token != settings.ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="管理接口鉴权失败")
+
+
+# 上传白名单：只接受文档与文本，防止上传可执行文件或脚本
+ALLOWED_UPLOAD_EXT = {".docx", ".doc", ".txt", ".pdf", ".md"}
+
+
+def _safe_filename(raw: str) -> str:
+    """
+    清洗上传文件名，防路径穿越。
+    仅取 basename（剥离 ../、绝对路径等），并拒绝空名与保留名。
+    """
+    name = Path(raw).name.strip()
+    if not name or name in {".", ".."}:
+        raise HTTPException(status_code=400, detail=f"非法文件名: {raw!r}")
+    if Path(name).suffix.lower() not in ALLOWED_UPLOAD_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不允许的文件类型: {Path(name).suffix or '(无扩展名)'}"
+        )
+    return name
+
+
 # ==================== 请求模型 ====================
 class ExamRequest(BaseModel):
     num_questions: int = 1
@@ -83,6 +120,9 @@ class ExamRequest(BaseModel):
 class AnswerItem(BaseModel):
     question_id: str
     user_answer: str
+    # 答题耗时（秒）。此前缺失该字段，Pydantic 会静默丢弃前端传入值，
+    # 导致答题时长永远记为 0，无法分析答题速度与识别秒选猜答。
+    duration: float = 0.0
 
 
 class EvaluateRequest(BaseModel):
@@ -122,9 +162,10 @@ class TTSRequest(BaseModel):
 
 class StudyPlanRequest(BaseModel):
     user_id: str
-    target_score: int = 425
+    # None 表示未指定，此时从用户档案读取（实现跨设备长期保存）
+    target_score: int | None = None
     days_left: int = 60
-    level: str = "CET4"
+    level: str | None = None
 
 
 # ==================== 工具函数 ====================
@@ -200,6 +241,8 @@ async def generate_from_wrong(req: WrongExamRequest):
 async def evaluate(req: EvaluateRequest):
     try:
         answers = [a.model_dump() for a in req.answers]
+        # 确保用户档案存在并刷新活跃时间，使学习数据有长期归属
+        await user_service.touch(req.user_id)
         result = await orchestrator.evaluate_and_review(req.user_id, answers)
         return {"code": 0, "data": result}
     except Exception as e:
@@ -212,13 +255,63 @@ async def evaluate(req: EvaluateRequest):
 async def study_predict_plan(req: StudyPlanRequest):
     """基于学情数据生成个性化学习方案（LLM 生成，可能耗时 10-20 秒）"""
     try:
+        # 未显式指定的 level / target_score，回退到用户档案中的长期设置
+        profile = await user_service.get_profile(req.user_id)
+        level = req.level or (profile or {}).get("level") or "CET4"
+        target_score = (
+            req.target_score
+            or (profile or {}).get("target_score")
+            or 425
+        )
+
+        task = {
+            "user_id": req.user_id,
+            "days_left": req.days_left,
+            "level": level,
+            "target_score": target_score,
+        }
         result = await study_plan_agent.execute(
-            req.model_dump(),
+            task,
             task_id=f"study_plan_{req.user_id}_{int(time.time())}",
         )
         return {"code": 0, "data": result}
     except Exception as e:
         logger.error(f"学习方案生成失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 用户档案 ====================
+@app.get("/api/user/{user_id}/profile")
+async def get_user_profile(user_id: str):
+    """
+    读取个人档案与累计学习统计。
+    首次访问自动建档（默认 CET4 / 425 分），保证后续学习数据有归属。
+    """
+    try:
+        return {"code": 0, "data": await user_service.get_study_overview(user_id)}
+    except Exception as e:
+        logger.error(f"读取用户档案失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/user/{user_id}/profile")
+async def update_user_profile(user_id: str, req: dict):
+    """
+    创建或更新个人档案。仅更新显式提供的字段。
+    level 支持 CET4/CET6；target_score 会被收敛到 220-710 合理区间。
+    """
+    try:
+        profile = await user_service.upsert_profile(
+            user_id,
+            username=req.get("username"),
+            level=req.get("level"),
+            target_score=req.get("target_score"),
+        )
+        return {"code": 0, "data": profile}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"更新用户档案失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -527,20 +620,45 @@ async def get_wrong(user_id: str):
 
 # ==================== 管理接口 ====================
 @app.post("/api/admin/upload")
-async def upload_files(files: list[UploadFile] = File(...)):
+async def upload_files(
+    files: list[UploadFile] = File(...),
+    _: None = Depends(require_admin),
+):
     upload_dir = Path("data/raw/real_papers")
     upload_dir.mkdir(parents=True, exist_ok=True)
+
+    saved, skipped = [], []
     for f in files:
-        file_path = upload_dir / f.filename
+        # 路径穿越防护：剥离目录成分，只保留纯文件名
+        safe_name = _safe_filename(f.filename or "")
+        file_path = upload_dir / safe_name
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(f.file, buffer)
+        saved.append(safe_name)
+
+    # 受控触发导入：仅在鉴权通过后执行，且不继承请求上下文
     import subprocess
-    subprocess.Popen([sys.executable, "scripts/import_real_papers.py"])
-    return {"code": 0, "message": f"{len(files)} 个文件已上传"}
+    try:
+        subprocess.Popen(
+            [sys.executable, "scripts/import_real_papers.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        import_started = True
+    except Exception as e:
+        logger.warning(f"导入脚本启动失败: {e}")
+        import_started = False
+
+    return {
+        "code": 0,
+        "message": f"{len(saved)} 个文件已上传",
+        "saved": saved,
+        "import_started": import_started,
+    }
 
 
 @app.get("/api/admin/unverified")
-async def get_unverified():
+async def get_unverified(_: None = Depends(require_admin)):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT question_id, content, answer, source "
@@ -552,7 +670,7 @@ async def get_unverified():
 
 
 @app.post("/api/admin/update-answer")
-async def update_answer(req: dict):
+async def update_answer(req: dict, _: None = Depends(require_admin)):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE questions SET answer=? WHERE question_id=?",
@@ -563,7 +681,7 @@ async def update_answer(req: dict):
 
 
 @app.post("/api/admin/verify")
-async def verify_question(req: dict):
+async def verify_question(req: dict, _: None = Depends(require_admin)):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE questions SET verified=1 WHERE question_id=?",

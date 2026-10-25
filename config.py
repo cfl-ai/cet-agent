@@ -20,8 +20,12 @@ class Settings:
     JIMENG_TOKEN = os.getenv("JIMENG_TOKEN", "")
 
     # ---- 服务器 ----
-    HOST = "0.0.0.0"
+    HOST = os.getenv("HOST", "127.0.0.1")
     PORT = 8001
+
+    # ---- 管理接口鉴权 ----
+    # 未配置时，所有 /api/admin/* 接口一律拒绝（503），避免裸奔
+    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
     # ---- 重试 ----
     MAX_RETRIES = {

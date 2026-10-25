@@ -30,8 +30,21 @@ class GradingAgent(BaseAgent):
     "improvements": ["具体改进建议1", "建议2"]
 }}"""
 
-    # ★ 主观题类型：不做 ABCD 硬判定
+    # 词汇类题型：错因优先归为词汇问题
+    VOCAB_TYPES = {"阅读-选词填空", "词汇辨析"}
+    # 主观题类型：不做 ABCD 硬判定
     SUBJECTIVE_TYPES = {"写作", "翻译-汉译英"}
+    # 秒选阈值（秒）：低于此时长基本没读完题干
+    RUSH_THRESHOLD = 5.0
+    # 长时间犹豫阈值（秒）：超过此时长仍错，多为概念不清
+    HESITATE_THRESHOLD = 60.0
+    # 错误类型中文映射（供学习方案与前端展示）
+    ERROR_TYPE_CN = {
+        "vocab": "词汇欠缺",
+        "careless": "粗心失误",
+        "concept": "概念不清",
+        "knowledge_gap": "知识漏洞",
+    }
 
     def __init__(self):
         super().__init__(name="GradingAgent", max_retries=2)
@@ -104,7 +117,7 @@ class GradingAgent(BaseAgent):
                         wrong_count = wrong_count + 1,
                         last_wrong_at = excluded.last_wrong_at
                     """, (task["user_id"], qid,
-                          self._infer_error_type(ans), time.time()))
+                          self._infer_error_type(ans, qtype), time.time()))
                     await self._update_knowledge(db, task["user_id"], tags, False)
 
                 results.append({
@@ -114,8 +127,17 @@ class GradingAgent(BaseAgent):
                     "user_answer": user_ans,
                     "correct_answer": correct_answer,
                     "explanation": explanation,
+                    # 错因诊断（答对为 None），供前端与学习方案使用
+                    "error_type": None if is_correct
+                                  else self._infer_error_type(ans, qtype),
+                    "error_type_cn": None if is_correct
+                                     else self.ERROR_TYPE_CN.get(
+                                         self._infer_error_type(ans, qtype), "知识漏洞"),
                 })
 
+            await self._update_study_stats(
+                db, task["user_id"], results, answers
+            )
             await db.commit()
 
         # 只统计客观题
@@ -131,6 +153,45 @@ class GradingAgent(BaseAgent):
             "accuracy": round(accuracy, 3),
             "details": results,
         }
+
+    async def _update_study_stats(self, db, user_id: str,
+                                  results: list, answers: list):
+        """
+        按日聚合学习统计。
+        此前 study_stats 表从未被写入，导致无法做学习趋势、打卡坚持度分析。
+        """
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        done = len(results)
+        correct = sum(1 for r in results if r.get("is_correct"))
+        # 主观题被跳过判定，不计入正确数也不计入总量
+        objective = [r for r in results if not r.get("skipped")]
+        done = len(objective)
+
+        total_seconds = 0.0
+        for a in answers:
+            try:
+                total_seconds += float(a.get("duration") or 0)
+            except (TypeError, ValueError):
+                continue
+        minutes = int(round(total_seconds / 60))
+
+        # 先确保当日记录存在，再做增量累加
+        await db.execute(
+            "INSERT OR IGNORE INTO study_stats (user_id, stat_date) VALUES (?, ?)",
+            (user_id, today),
+        )
+        await db.execute(
+            """
+            UPDATE study_stats SET
+                questions_done = questions_done + ?,
+                correct_count = correct_count + ?,
+                study_minutes = study_minutes + ?
+            WHERE user_id = ? AND stat_date = ?
+            """,
+            (done, correct, minutes, user_id, today),
+        )
 
     async def _update_knowledge(self, db, user_id: str, tags_json: str,
                                   correct: bool):
@@ -164,8 +225,31 @@ class GradingAgent(BaseAgent):
                      1 if correct else 0, time.time())
                 )
 
-    def _infer_error_type(self, ans: dict) -> str:
-        """简化错误类型推断"""
+    def _infer_error_type(self, ans: dict, qtype: str = "") -> str:
+        """
+        错误类型推断。
+
+        此前该函数恒返回硬编码 "knowledge_gap"，导致学习方案中的
+        "错题类型分布"永远是同一类，诊断完全失去意义。
+
+        现基于两个真实信号推断：
+          - 题型：词汇类题型错 → vocab（词汇欠缺）
+          - 答题时长：秒选(<5s) → careless（粗心/未读题）
+                     长时间犹豫(>60s)仍错 → concept（概念不清）
+                     其余 → knowledge_gap（知识漏洞）
+        """
+        if qtype in self.VOCAB_TYPES:
+            return "vocab"
+
+        try:
+            duration = float(ans.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+        if 0 < duration < self.RUSH_THRESHOLD:
+            return "careless"
+        if duration > self.HESITATE_THRESHOLD:
+            return "concept"
         return "knowledge_gap"
 
     async def grade_writing(self, topic: str, essay: str) -> dict:
