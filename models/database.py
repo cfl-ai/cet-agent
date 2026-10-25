@@ -144,6 +144,39 @@ async def init_db():
             )
         """)
 
+        # 真实考试成绩 — 预测模型的监督信号来源。
+        # 此前 train_predictor.py 的标签由掌握度自举推导（290+avg*420），
+        # 模型只是在复述这条公式，训再多也不会变准。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_exam_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                level TEXT,
+                score INTEGER,
+                exam_date TEXT,
+                source TEXT DEFAULT 'real_exam',
+                created_at REAL
+            )
+        """)
+
+        # 模型版本注册表 — 记录每次训练的结果，用于自动晋升与回滚决策
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS model_registry (
+                version INTEGER PRIMARY KEY AUTOINCREMENT,
+                trained_at REAL,
+                sample_count INTEGER,
+                train_mae REAL,
+                val_mae REAL,
+                baseline_mae REAL,
+                status TEXT,
+                note TEXT
+            )
+        """)
+
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exam_score_user "
+            "ON user_exam_scores(user_id)")
+
         # 索引
         await db.execute("CREATE INDEX IF NOT EXISTS idx_answer_user ON answer_records(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_wrong_user ON wrong_questions(user_id)")

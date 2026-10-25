@@ -22,6 +22,9 @@ class ReviewAgent(BaseAgent):
     async def _run(self, task: dict) -> dict:
         user_id = task["user_id"]
 
+        # 在线学习产物热更新：后台训练出新版本后无需重启即可生效
+        self.predictor.reload_if_newer()
+
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM wrong_questions WHERE user_id=? AND resolved=0",
@@ -56,12 +59,32 @@ class ReviewAgent(BaseAgent):
             "predicted_score": prediction["predicted_score"],
             "pass_probability": prediction["pass_probability"],
             "prediction_model": prediction.get("model", "heuristic"),
+            # 模型透明度：让用户知道预测是"学了 N 个人数据"还是"冷启动猜的"
+            "model_version": prediction.get("model_version", 0),
+            "training_samples": prediction.get("training_samples", 0),
+            "model_mae": prediction.get("model_mae"),
+            "prediction_confidence": self._confidence(prediction),
             "mastery_vector": {k: round(v, 3) for k, v in mastery.items()},
             "wrong_count": wrong_count,
             "weak_points": weak_points,
             "suggestion": suggestion,
             "timestamp": time.time(),
         }
+
+    @staticmethod
+    def _confidence(prediction: dict) -> str:
+        """
+        预测可信度分级。冷启动阶段必须如实告诉用户"还不太准"，
+        避免把启发式猜测当成精确预测。
+        """
+        if prediction.get("model", "heuristic") == "heuristic":
+            return "cold"
+        samples = prediction.get("training_samples") or 0
+        if samples < 10:
+            return "low"
+        if samples < 50:
+            return "medium"
+        return "high"
 
     async def _generate_suggestion(self, user_id, mastery, weak_points,
                                      wrong_count, predicted) -> str:

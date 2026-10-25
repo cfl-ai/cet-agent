@@ -19,6 +19,7 @@ from agents.content_agent import ContentAgent
 from agents.research_agent import ResearchAgent
 from agents.graph_orchestrator import get_graph, is_enabled as graph_enabled
 from agents.study_plan_agent import StudyPlanAgent
+from agents.grading_agent import GradingAgent
 from models.database import init_db, DB_PATH
 from models.seed_data import seed_if_empty
 from models.schemas import (TranslateRequest, ASRRequest, ContentGenRequest)
@@ -29,6 +30,7 @@ from services.vector_service import vector_service
 from services.tts_service import tts_service, AUDIO_CACHE_DIR
 from services import user_service
 from services import analytics_service
+from services import learning_service
 from core.monitor import metrics
 from core.telemetry import setup_telemetry, is_enabled as telemetry_enabled
 
@@ -60,6 +62,9 @@ async def lifespan(app: FastAPI):
         f"智能规划: {graph_enabled()} | "
         f"服务端TTS: {tts_service.available}"
     )
+
+    # 启动时检查一次：若已有足够真实分数样本而模型停留在旧版本，自动补训
+    learning_service.schedule_training("startup")
 
     yield
     await llm_client.close()
@@ -175,6 +180,61 @@ class VocabReviewRequest(BaseModel):
     count: int = 1
 
 
+class ExamScoreRequest(BaseModel):
+    """真实考试成绩录入 — 预测模型的监督信号（自举标签不会让模型变准）"""
+    user_id: str
+    score: int = 425
+    level: str = "CET4"
+    exam_date: str | None = None
+
+
+# ==================== 模考折算 ====================
+# 四六级各部分的标准分权重（听力/阅读各35%，写作/翻译各15%）
+SECTION_WEIGHTS = {"听力": 248.5, "阅读": 248.5, "翻译": 106.5, "写作": 106.5}
+# 主观题给分基准：写了答案按满分的65%折算（卷面中位水平），空白0分
+SUBJECTIVE_BASELINE = 0.65
+SCORE_FLOOR = 220
+
+
+def _section_of(qtype: str) -> str | None:
+    for key in SECTION_WEIGHTS:
+        if key in (qtype or ""):
+            return key
+    return None
+
+
+def _estimate_paper_score(answers: dict, qmap: dict,
+                          subjective_types: set) -> int:
+    """
+    把模考作答折算成标准分。
+    此前 paper/submit 恒写 score=0，等于白白丢掉一个真实监督信号源。
+    未作答的部分不计分（如实反映发挥），总分保底 220（四六级报道分下限）。
+    """
+    stats: dict[str, list] = {}
+    for qid, user_ans in (answers or {}).items():
+        info = qmap.get(qid)
+        if not info:
+            continue
+        qtype, correct_ans = info
+        section = _section_of(qtype) or "阅读"
+        answered = str(user_ans or "").strip()
+
+        if qtype in subjective_types:
+            correct = SUBJECTIVE_BASELINE if answered else 0.0
+        elif not correct_ans:
+            continue
+        else:
+            correct = (1.0 if answered.upper() == str(correct_ans).strip().upper()
+                       else 0.0)
+
+        total, got = stats.get(section, [0, 0.0])
+        stats[section] = [total + 1, got + correct]
+
+    score = sum((got / total) * SECTION_WEIGHTS[section]
+                for section, (total, got) in stats.items() if total)
+    return max(SCORE_FLOOR, min(710, int(round(score))))
+
+
 # ==================== 工具函数 ====================
 async def save_questions_to_db(questions: list[dict]):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -251,6 +311,8 @@ async def evaluate(req: EvaluateRequest):
         # 确保用户档案存在并刷新活跃时间，使学习数据有长期归属
         await user_service.touch(req.user_id)
         result = await orchestrator.evaluate_and_review(req.user_id, answers)
+        # 每次答题都可能让样本达到触发阈值，交给后台判断是否该重训
+        learning_service.schedule_training("answer_graded")
         return {"code": 0, "data": result}
     except Exception as e:
         logger.error(f"评估失败: {e}")
@@ -371,6 +433,27 @@ async def user_exams(user_id: str, limit: int = 20):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/user/{user_id}/exam-score")
+async def record_exam_score(user_id: str, req: ExamScoreRequest):
+    """
+    录入真实考试成绩 — 这是预测模型最有价值的监督信号。
+
+    之前的训练标签是由掌握度自举推导的假标签，模型只是在复述公式；
+    只有真实分数才能让预测真的越来越准。分数收敛到 0-710 后入库，
+    并异步触发训练检查（够样本就会自动训练并择优晋升）。
+    """
+    try:
+        data = await learning_service.record_true_score(
+            user_id, req.score, level=req.level, exam_date=req.exam_date)
+        learning_service.schedule_training("real_exam_score")
+        return {"code": 0, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"考试成绩录入失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== 智能规划入口 ====================
 @app.post("/api/agent/run")
 async def agent_run(req: AgentRunRequest):
@@ -482,16 +565,32 @@ async def paper_submit(req: PaperSubmitRequest):
         elapsed = time.time() - started_at
         status = "timeout" if elapsed >= duration else "completed"
 
+        # 折算真实得分。此前恒为 0，白白丢掉一个真实监督信号源
+        qmap = {}
+        qids = list((req.answers or {}).keys())
+        if qids:
+            placeholders = ",".join("?" * len(qids))
+            cursor = await db.execute(
+                f"SELECT question_id, question_type, answer FROM questions "
+                f"WHERE question_id IN ({placeholders})", qids)
+            qmap = {r[0]: (r[1] or "", r[2] or "") for r in await cursor.fetchall()}
+        score = _estimate_paper_score(
+            req.answers, qmap, GradingAgent.SUBJECTIVE_TYPES)
+
         await db.execute("""
             UPDATE exam_sessions SET ended_at=?, status=?, answers=?, score=?
             WHERE session_id=?
         """, (time.time(), status,
               json.dumps(req.answers, ensure_ascii=False),
-              0, req.session_id))
+              score, req.session_id))
         await db.commit()
+
+    # 新增了一个真实分数标签，可能够触发下一轮在线训练
+    learning_service.schedule_training("paper_submit")
 
     return {"code": 0, "data": {
         "session_id": req.session_id, "status": status, "elapsed": elapsed,
+        "score": score,
     }}
 
 
@@ -762,6 +861,23 @@ async def verify_question(req: dict, _: None = Depends(require_admin)):
         )
         await db.commit()
     return {"code": 0}
+
+
+@app.get("/api/admin/model/status")
+async def model_status(_: None = Depends(require_admin)):
+    """在线学习状态：当前模型版本、样本数、误差、训练历史"""
+    return {"code": 0, "data": await learning_service.get_model_status()}
+
+
+@app.post("/api/admin/model/train")
+async def model_train(_: None = Depends(require_admin)):
+    """手动触发一次训练（忽略"样本是否增长"的判断，但仍走择优晋升）"""
+    try:
+        return {"code": 0, "data": await learning_service.train_if_needed(
+            force=True)}
+    except Exception as e:
+        logger.error(f"手动训练失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== 静态文件 ====================
