@@ -42,7 +42,27 @@ async def migrate():
         """)
         print("✅ exam_sessions 表创建成功")
 
-        # 3. 新增 listening_assets 表（听力音频缓存）
+        # 2b. 补齐 exam_sessions 真题套卷字段
+        # 注意：main.py 的 /api/exam/paper/* 依赖这些列，
+        # 而本脚本的建表语句是分项计分结构，两套 schema 必须共存，
+        # 否则套卷接口会报 "no such column"。
+        for col, typedef in [
+            ("year", "INTEGER"),
+            ("month", "INTEGER"),
+            ("set_number", "INTEGER"),
+            ("duration_seconds", "INTEGER"),
+            ("score", "INTEGER"),
+            ("created_at", "REAL"),
+        ]:
+            try:
+                await db.execute(
+                    f"ALTER TABLE exam_sessions ADD COLUMN {col} {typedef}"
+                )
+                print(f"✅ exam_sessions.{col} 添加成功")
+            except Exception as e:
+                print(f"ℹ️ exam_sessions.{col} 已存在: {e}")
+
+        # 2c. 新增 listening_assets 表（听力音频缓存）
         await db.execute("""
             CREATE TABLE IF NOT EXISTS listening_assets (
                 asset_id TEXT PRIMARY KEY,

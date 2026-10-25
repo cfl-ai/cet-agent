@@ -11,10 +11,15 @@ data/models/
 data/parsed/
 data/ch*
 data/*.jsonl
+data/audio_cache/
+data/audio/
 *.log
 *.db
 *.db-journal
+*.db.*
 *.bak
+*.bak.*
+*.mp3
 *.zip
 .idea/
 .vscode/
