@@ -181,8 +181,11 @@ class VocabReviewRequest(BaseModel):
 
 
 class ExamScoreRequest(BaseModel):
-    """真实考试成绩录入 — 预测模型的监督信号（自举标签不会让模型变准）"""
-    user_id: str
+    """真实考试成绩录入 — 预测模型的监督信号（自举标签不会让模型变准）
+
+    user_id 取自路径参数，body 中可不传（保持与其他 /api/user/{id}/* 接口一致）。
+    """
+    user_id: str | None = None
     score: int = 425
     level: str = "CET4"
     exam_date: str | None = None

@@ -98,6 +98,7 @@ select.input { width: auto; min-width: 120px; margin-bottom: 0; }
     <button class="tab" data-tab="wrong">❌ 错题本</button>
     <button class="tab" data-tab="diagnose">📊 学情诊断</button>
     <button class="tab" data-tab="plan">🧠 学情预测</button>
+    <button class="tab" data-tab="profile">📈 成长档案</button>
     <button class="tab" data-tab="assistant">🤖 智能助手</button>
     <button class="tab" data-tab="tools">🛠️ AI工具箱</button>
   </div>
@@ -245,6 +246,40 @@ select.input { width: auto; min-width: 120px; margin-bottom: 0; }
     <div id="plan-area" style="margin-top:16px;">
       <p style="color:#718096;font-size:14px;text-align:center;padding:20px;">
         点击上方按钮，AI 将分析你的学情数据并生成方案
+      </p>
+    </div>
+  </div>
+
+  <!-- ========== 6.5 成长档案 ========== -->
+  <div class="panel" id="profile">
+    <div class="btn-row">
+      <button class="btn" onclick="loadProfile()">🔄 刷新档案</button>
+      <span style="font-size:12px;color:#a0aec0;" id="profile-updated"></span>
+    </div>
+
+    <div class="card" style="background:linear-gradient(135deg,#fffaf0,#f0fff4);">
+      <h3>🏆 录入真实考试成绩</h3>
+      <p style="font-size:12px;color:#718096;margin-bottom:12px;line-height:1.6;">
+        录入你的四/六级真实成绩，AI 会据此<strong>持续训练预测模型</strong>，
+        让你学得越多、分数预测越准。这是预测越来越准的关键数据源。
+      </p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;">
+        <select class="input" id="score-level" style="margin-bottom:0;">
+          <option value="CET4">四级</option>
+          <option value="CET6">六级</option>
+        </select>
+        <input class="input" id="score-value" type="number" value="425"
+               min="0" max="710" style="margin-bottom:0;" placeholder="总分 0-710">
+        <input class="input" id="score-date" type="date" style="margin-bottom:0;">
+      </div>
+      <button class="btn" style="margin-top:12px;width:100%;" onclick="submitExamScore()">
+        💾 录入成绩并触发模型学习
+      </button>
+    </div>
+
+    <div id="profile-area">
+      <p style="color:#718096;font-size:14px;text-align:center;padding:20px;">
+        点击上方「🔄 刷新档案」查看你的学习成长数据
       </p>
     </div>
   </div>

@@ -570,7 +570,11 @@ async function loadDiagnose() {
     area.innerHTML = '<p style="color:#718096;">先完成一些练习再查看诊断</p>';
     return;
   }
-  const modelLabel = {mlp: "🤖 MLP模型", heuristic: "📐 启发式"}[review.prediction_model] || "";
+  const modelLabel = {mlp: "🤖 MLP模型", heuristic: "📐 启发式(数据不足)"}[review.prediction_model] || "";
+  const confLabel = {cold: "❄️ 冷启动", low: "🔰 低", medium: "⚡ 中", high: "🎯 高"}[review.prediction_confidence] || "—";
+  const modelInfo = review.prediction_model === "mlp"
+    ? `模型 v${review.model_version || 0} · 训练样本 ${review.training_samples || 0} · 误差 ±${(review.model_mae != null ? review.model_mae.toFixed(1) : '—')}分`
+    : "尚未有真实成绩数据，预测为启发式估算";
 
   area.innerHTML = `
     <div class="stat-grid">
@@ -582,10 +586,128 @@ async function loadDiagnose() {
         ${(review.pass_probability*100).toFixed(0)}%</div><div class="label">过线概率</div></div>
     </div>
     <div class="card">
-      <h3>🎯 备考建议 <span style="font-size:12px;color:#a0aec0;">(${modelLabel})</span></h3>
+      <h3>🎯 备考建议 <span style="font-size:12px;color:#a0aec0;">(${modelLabel} · 置信度 ${confLabel})</span></h3>
+      <p style="font-size:13px;color:#718096;margin-bottom:8px;">📡 ${modelInfo}</p>
       <p style="font-size:14px;line-height:1.7;">${review.suggestion}</p>
     </div>
   `;
+}
+
+// ==================== 6.5 成长档案 ====================
+async function loadProfile() {
+  const area = document.getElementById('profile-area');
+  area.innerHTML = '<div class="loading">加载成长档案...</div>';
+  try {
+    const resp = await fetch('/api/user/' + USER_ID + '/analytics?days=30');
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '加载失败');
+    const d = data.data || {};
+    const p = d.profile || {};
+    const streak = d.streak || {};
+    const weak = d.weak_points || [];
+    const exams = d.recent_exams || [];
+    const trend = d.trend || [];
+
+    const overview = `
+      <div class="stat-grid">
+        <div class="stat"><div class="value">${p.total_answered || 0}</div><div class="label">累计答题</div></div>
+        <div class="stat"><div class="value">${((p.accuracy || 0) * 100).toFixed(0)}%</div><div class="label">总正确率</div></div>
+        <div class="stat"><div class="value">${streak.current_streak || 0}</div><div class="label">连续打卡(天)</div></div>
+        <div class="stat"><div class="value">${streak.longest_streak || 0}</div><div class="label">最长连续</div></div>
+        <div class="stat"><div class="value">${p.active_days || 0}</div><div class="label">累计学习(天)</div></div>
+        <div class="stat"><div class="value">${p.open_wrong || 0}</div><div class="label">待复习错题</div></div>
+      </div>`;
+
+    const meta = `
+      <div class="card" style="background:#f7fafc;">
+        <h3>🎯 我的目标</h3>
+        <p style="font-size:14px;">备考级别：<strong>${escapeHtml(p.level || 'CET4')}</strong>　
+           目标分数：<strong>${p.target_score || '—'}</strong></p>
+        <p style="font-size:12px;color:#718096;margin-top:6px;">
+          近 7 天答题 ${d.last_7d_questions || 0} 题 · 学习约 ${Math.round((d.last_7d_minutes || 0) / 60)} 小时
+        </p>
+      </div>`;
+
+    const weakHtml = weak.length ? weak.map(w => {
+      const pct = ((w.mastery || 0) * 100).toFixed(0);
+      const color = w.mastery >= 0.7 ? '#48bb78' : (w.mastery >= 0.5 ? '#ed8936' : '#f56565');
+      const badge = w.open_wrong ? `<span class="badge orange">错题${w.open_wrong}</span>` : '';
+      return `
+        <div style="margin-top:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;">
+            <span>${escapeHtml(w.point)} ${badge}</span>
+            <span style="color:${color};font-weight:600;">${pct}%</span>
+          </div>
+          <div style="height:8px;background:#e2e8f0;border-radius:4px;margin-top:4px;overflow:hidden;">
+            <div style="width:${pct}%;height:100%;background:${color};"></div>
+          </div>
+          <p style="font-size:11px;color:#a0aec0;margin-top:4px;">
+            练习 ${w.attempts} 次 · 正确 ${w.correct} 次
+          </p>
+        </div>`;
+    }).join('') : '<p style="color:#718096;">暂无薄弱点数据，多做练习即可建立掌握度画像</p>';
+    const weakCard = `<div class="card"><h3>📉 薄弱知识点（优先补）</h3>${weakHtml}</div>`;
+
+    const recentTrend = trend.slice(-14);
+    const maxQ = Math.max(1, ...recentTrend.map(t => t.questions_done || 0));
+    const trendHtml = recentTrend.map(t => {
+      const h = Math.round((t.questions_done || 0) / maxQ * 60);
+      const label = (t.date || '').slice(5);
+      return `
+        <div style="flex:1;text-align:center;">
+          <div style="display:flex;align-items:flex-end;justify-content:center;height:64px;">
+            <div title="${t.questions_done || 0} 题"
+                 style="width:72%;background:#3182ce;border-radius:3px 3px 0 0;height:${Math.max(2, h)}px;"></div>
+          </div>
+          <div style="font-size:9px;color:#a0aec0;margin-top:2px;">${label}</div>
+        </div>`;
+    }).join('');
+    const trendCard = `<div class="card"><h3>📅 近 14 天答题量</h3>
+        <div style="display:flex;gap:2px;align-items:flex-end;">${trendHtml}</div></div>`;
+
+    const examHtml = exams.length ? exams.map(e => {
+      const used = e.used_seconds ? formatTime(e.used_seconds) : '—';
+      const score = e.score ? e.score : '未计分';
+      return `<div style="padding:10px 0;border-bottom:1px solid #e2e8f0;
+                    font-size:13px;display:flex;justify-content:space-between;">
+        <span>${escapeHtml(e.level || '')} ${e.year || ''}.${String(e.month || '').padStart(2, '0')} 第${e.set_number || ''}套</span>
+        <span>⏱️ ${used}　📊 ${score}</span>
+      </div>`;
+    }).join('') : '<p style="color:#718096;">还没有模考记录，去「📋 真题演练」试试</p>';
+    const examCard = `<div class="card"><h3>📋 最近模考</h3>${examHtml}</div>`;
+
+    area.innerHTML = overview + meta + weakCard + trendCard + examCard;
+    const upd = document.getElementById('profile-updated');
+    if (upd) upd.textContent = '更新于 ' +
+      new Date((d.generated_at || (Date.now() / 1000)) * 1000).toLocaleString('zh-CN');
+  } catch (e) {
+    area.innerHTML = `<div style="color:#f56565;">加载失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function submitExamScore() {
+  const scoreEl = document.getElementById('score-value');
+  const score = parseInt(scoreEl.value, 10);
+  const level = document.getElementById('score-level').value;
+  const date = document.getElementById('score-date').value || null;
+  if (!score || score < 0 || score > 710) {
+    showToast('请输入 0-710 之间的有效分数', 2500);
+    scoreEl.focus();
+    return;
+  }
+  try {
+    const resp = await fetch('/api/user/' + USER_ID + '/exam-score', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({score, level, exam_date: date}),
+    });
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '录入失败');
+    showToast('✅ 成绩已录入，AI 将据此持续学习（样本够即自动训练）', 3000);
+    loadProfile();
+  } catch (e) {
+    showToast('❌ ' + e.message, 3000);
+  }
 }
 
 // ==================== 6. 学情预测与学习方案 ====================
