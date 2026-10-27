@@ -455,40 +455,84 @@ class TestHotReloadAndConfidence:
 # ==================== 模考折算 ====================
 
 class TestPaperScoring:
+    """模考折算必须只认真实可判定的作答。
 
-    def test_full_correct_scores_near_max(self):
-        from main import _estimate_paper_score
-        qmap = {
-            "1": ("听力-长对话", "A"), "2": ("听力-短文听力", "B"),
-            "3": ("阅读-仔细阅读", "C"), "4": ("阅读-段落匹配", "D"),
-            "5": ("翻译-汉译英", "参考译文"), "6": ("写作", "范文"),
+    旧实现的两个失真点：
+      1. 字符串 upper() 直接比较，全角/空格/多选顺序都可能误判；
+      2. 主观题固定给 65% 基准分——用户没做 AI 批改也能白拿分。
+    现在：客观题归一化比较、未核验答案跳过、主观题只在真有批改分时折算。
+    """
+
+    def _qmap(self):
+        return {
+            "1": ("听力-长对话", "A", "ai_generated", 1),
+            "2": ("听力-短文听力", "B", "ai_generated", 1),
+            "3": ("阅读-仔细阅读", "C", "ai_generated", 1),
+            "4": ("阅读-段落匹配", "D", "ai_generated", 1),
+            "5": ("翻译-汉译英", "", "real_cet4_2020", 0),
+            "6": ("写作", "", "real_cet4_2020", 0),
         }
+
+    def test_full_correct_with_real_grades_scores_near_max(self):
+        from main import _estimate_paper_score
         answers = {"1": "A", "2": "B", "3": "C", "4": "D",
                    "5": "我的译文", "6": "我的作文"}
-        score = _estimate_paper_score(answers, qmap,
-                                      {"写作", "翻译-汉译英"})
-        # 客观题全对 497 分 + 主观题中位 (213.5*0.65≈138.8) ≈ 636
-        assert 620 <= score <= 645, score
+        score, meta = _estimate_paper_score(
+            answers, self._qmap(), {"写作", "翻译-汉译英"},
+            latest_subjective={"writing": 15, "translation": 15})
+        # 客观题全对 497 + 主观题满分 213 ≈ 710
+        assert 700 <= score <= 710, (score, meta)
+        assert meta["subjective_scored"] == ["translation", "writing"]
+
+    def test_full_correct_without_grades_has_no_free_subjective_points(self):
+        from main import _estimate_paper_score
+        answers = {"1": "A", "2": "B", "3": "C", "4": "D",
+                   "5": "我的译文", "6": "我的作文"}
+        score, meta = _estimate_paper_score(
+            answers, self._qmap(), {"写作", "翻译-汉译英"})
+        # 主观题没有批改分 → 记 0，只剩客观题 497
+        assert 490 <= score <= 500, (score, meta)
+        assert meta["subjective_missing"], "应提示主观题未评分"
 
     def test_all_wrong_floor_at_220(self):
         from main import _estimate_paper_score
-        qmap = {"1": ("听力-长对话", "A"), "2": ("阅读-仔细阅读", "B")}
-        score = _estimate_paper_score({"1": "Z", "2": "Z"}, qmap, set())
-        assert score == 220, "全对应保底 220（报道分下限）"
+        qmap = {"1": ("听力-长对话", "A", "ai_generated", 1),
+                "2": ("阅读-仔细阅读", "B", "ai_generated", 1)}
+        score, _ = _estimate_paper_score({"1": "Z", "2": "Z"}, qmap, set())
+        assert score == 220, "全错应保底 220（报道分下限）"
+
+    def test_answer_normalization_counts_fullwidth_and_lowercase(self):
+        from main import _estimate_paper_score
+        qmap = {"1": ("阅读-仔细阅读", "A", "ai_generated", 1)}
+        score, _ = _estimate_paper_score({"1": "ａ "}, qmap, set())
+        # 全角小写 a 归一化后应判对；单题全对 → 阅读单项满分
+        assert score > 220, f"归一化后应判对，实际 {score}"
+
+    def test_unverified_real_answer_is_skipped(self):
+        from main import _estimate_paper_score
+        qmap = {"1": ("阅读-仔细阅读", "A", "real_cet4_2015", 0),
+                "2": ("阅读-仔细阅读", "A", "ai_generated", 1)}
+        score, meta = _estimate_paper_score({"1": "A", "2": "B"}, qmap, set())
+        assert meta["skipped_unverified"] == 1
+        # 未核验题不计入分母：唯一有效题答错 → 0 分 → 保底 220
+        assert score == 220
 
     def test_blank_subjective_gets_nothing(self):
         from main import _estimate_paper_score
-        qmap = {"5": ("写作", "范文"), "1": ("阅读-仔细阅读", "A")}
-        answered = _estimate_paper_score({"5": "作文", "1": "A"}, qmap,
-                                        {"写作"})
-        blank = _estimate_paper_score({"5": "", "1": "A"}, qmap, {"写作"})
-        assert answered > blank, "主观题空白应低于写了答案"
+        qmap = {"5": ("写作", "", "real_cet4_2020", 0),
+                "1": ("阅读-仔细阅读", "A", "ai_generated", 1)}
+        answered, _ = _estimate_paper_score(
+            {"5": "作文", "1": "A"}, qmap, {"写作"},
+            latest_subjective={"writing": 12})
+        blank, _ = _estimate_paper_score(
+            {"5": "", "1": "A"}, qmap, {"写作"},
+            latest_subjective={"writing": 12})
+        assert answered > blank, "主观题空白不应拿到批改分"
 
     def test_unknown_question_id_ignored(self):
         from main import _estimate_paper_score
-        score = _estimate_paper_score({"nope": "A"}, {}, set())
+        score, _ = _estimate_paper_score({"nope": "A"}, {}, set())
         assert score == 220
-
 
 # ==================== 实考录入 ====================
 

@@ -1,8 +1,11 @@
 import json
 import re
-import aiosqlite
 import time
 import logging
+import unicodedata
+
+import aiosqlite
+
 from agents.base import BaseAgent
 from services.llm_client import llm_client
 from models.database import DB_PATH
@@ -68,8 +71,8 @@ class GradingAgent(BaseAgent):
                     continue
 
                 cursor = await db.execute(
-                    "SELECT answer, explanation, knowledge_tags, question_type "
-                    "FROM questions WHERE question_id = ?",
+                    "SELECT answer, explanation, knowledge_tags, question_type, "
+                    "source, verified FROM questions WHERE question_id = ?",
                     (qid,)
                 )
                 row = await cursor.fetchone()
@@ -81,22 +84,52 @@ class GradingAgent(BaseAgent):
                 explanation = row[1] or ""
                 tags = row[2] or "[]"
                 qtype = row[3] or ""
+                source = row[4] or ""
+                verified = row[5] or 0
+                ungradable_reason = self._ungradable_reason(
+                    correct_answer, source, verified)
 
-                # ★ 主观题：不判对错，只展示参考答案
+                # ★ 主观题：客观判分不适用，交给专门的批改接口按评分标准打分
                 if qtype in self.SUBJECTIVE_TYPES:
                     results.append({
                         "question_id": qid,
                         "question_type": qtype,
                         "is_correct": None,
+                        "gradable": False,
+                        "grading": "subjective",
                         "user_answer": user_ans,
                         "correct_answer": correct_answer or "见解析",
-                        "explanation": explanation or "主观题请对照参考答案自查。",
+                        "explanation": explanation or (
+                            "主观题不做客观判分。写作请调用 /api/grade/writing，"
+                            "翻译请调用 /api/grade/translation 获取按评分标准"
+                            "给出的真实分数与逐句批注。"
+                        ),
                         "skipped": True,
                     })
                     continue
 
-                # 客观题：正常判分
-                is_correct = user_ans.upper() == correct_answer.strip().upper()
+                # ★ 无法可靠判分的题：跳过计分，避免把错误答案写进学情。
+                #   真题导入时答案曾被硬编码为 "A" 且 verified=0（1090 道），
+                #   拿它判定用户"做错"会系统性污染错题本与掌握度。
+                if ungradable_reason:
+                    results.append({
+                        "question_id": qid,
+                        "question_type": qtype,
+                        "is_correct": None,
+                        "gradable": False,
+                        "grading": "ungradable",
+                        "ungradable_reason": ungradable_reason,
+                        "user_answer": user_ans,
+                        "correct_answer": correct_answer,
+                        "explanation": explanation or (
+                            "该题答案尚未核验，暂不参与判分与学情统计。"
+                        ),
+                        "skipped": True,
+                    })
+                    continue
+
+                # 客观题：答案归一化后比较（全角/空格/大小写/多选顺序）
+                is_correct = self._answers_match(user_ans, correct_answer)
 
                 # 记录答题
                 await db.execute("""
@@ -129,6 +162,8 @@ class GradingAgent(BaseAgent):
                     "question_id": qid,
                     "question_type": qtype,
                     "is_correct": is_correct,
+                    "gradable": True,
+                    "grading": "objective",
                     "user_answer": user_ans,
                     "correct_answer": correct_answer,
                     "explanation": explanation,
@@ -145,10 +180,12 @@ class GradingAgent(BaseAgent):
             )
             await db.commit()
 
-        # 只统计客观题
-        objective = [r for r in results if not r.get("skipped")]
-        total_obj = len(objective)
+        # 只统计"真正判了分"的客观题：主观题与答案未核验题不计入正确率
+        graded = [r for r in results if r.get("gradable") is True]
+        total_obj = len(graded)
         accuracy = correct_count / total_obj if total_obj else 0
+        ungradable = [r for r in results if r.get("grading") == "ungradable"]
+        subjective = [r for r in results if r.get("grading") == "subjective"]
 
         return {
             "user_id": task["user_id"],
@@ -156,6 +193,14 @@ class GradingAgent(BaseAgent):
             "objective_total": total_obj,
             "correct": correct_count,
             "accuracy": round(accuracy, 3),
+            "ungradable_count": len(ungradable),
+            "subjective_count": len(subjective),
+            # 明确告诉前端/调用方：有多少题因答案未核验而未计分
+            "grading_note": (
+                "主观题与答案未核验题不计入正确率；"
+                "写作/翻译请调用对应批改接口"
+                if (subjective or ungradable) else None
+            ),
             "details": results,
         }
 
@@ -168,11 +213,10 @@ class GradingAgent(BaseAgent):
         from datetime import datetime
         today = datetime.now().strftime("%Y-%m-%d")
 
-        done = len(results)
-        correct = sum(1 for r in results if r.get("is_correct"))
-        # 主观题被跳过判定，不计入正确数也不计入总量
-        objective = [r for r in results if not r.get("skipped")]
-        done = len(objective)
+        # 只统计真正判了分的客观题（主观题/答案未核验题不计）
+        graded = [r for r in results if r.get("gradable") is True]
+        done = len(graded)
+        correct = sum(1 for r in graded if r.get("is_correct"))
 
         total_seconds = 0.0
         for a in answers:
@@ -278,6 +322,46 @@ class GradingAgent(BaseAgent):
         if duration > self.HESITATE_THRESHOLD:
             return "concept"
         return "knowledge_gap"
+
+    # ==================== 判分基础：答案归一化与可信度 ====================
+    @staticmethod
+    def _normalize_answer(value: str) -> str:
+        """答案归一化：全角→半角、去空白与标点、转大写、多选排序。
+
+        真实判分不能只做 upper()：用户可能输入 "a "、"Ａ"、"B,A"，
+        多选答案的书写顺序也不应影响判定。
+        """
+        if value is None:
+            return ""
+        text = unicodedata.normalize("NFKC", str(value)).strip().upper()
+        text = re.sub(r"[\s,.，、;；/|\-]+", "", text)
+        if re.fullmatch(r"[A-H]{2,}", text):
+            text = "".join(sorted(set(text)))
+        return text
+
+    def _answers_match(self, user_ans: str, correct_ans: str) -> bool:
+        """归一化后比较用户答案与标准答案。"""
+        user_norm = self._normalize_answer(user_ans)
+        correct_norm = self._normalize_answer(correct_ans)
+        return bool(user_norm) and user_norm == correct_norm
+
+    @staticmethod
+    def _ungradable_reason(correct_answer: str, source: str,
+                           verified) -> str | None:
+        """判断一道客观题是否"不能可靠判分"。
+
+        真实的判分必须先保证答案可信：
+          - answer_missing：标准答案缺失 → 无法判错
+          - answer_unverified：真题导入时答案曾被硬编码为 "A"（verified=0），
+            这类题判对/判错都会把系统性错误写进错题本与掌握度
+        """
+        answer = (correct_answer or "").strip()
+        if not answer:
+            return "answer_missing"
+        src = str(source or "")
+        if not verified and src.startswith("real_"):
+            return "answer_unverified"
+        return None
 
     async def grade_writing(self, topic: str, essay: str) -> dict:
         """写作评分（单独调用）"""

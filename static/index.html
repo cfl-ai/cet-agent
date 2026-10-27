@@ -94,8 +94,9 @@ select.input { width: auto; min-width: 120px; margin-bottom: 0; }
   <div class="tabs">
     <button class="tab active" data-tab="vocab">📚 单词复习</button>
     <button class="tab" data-tab="practice">📝 专项训练</button>
-    <button class="tab" data-tab="paper">📋 真题演练</button>
+    <button class="tab" data-tab="paper">📋 模考演练</button>
     <button class="tab" data-tab="wrong">❌ 错题本</button>
+    <button class="tab" data-tab="grade">✍️ AI 批改</button>
     <button class="tab" data-tab="diagnose">📊 学情诊断</button>
     <button class="tab" data-tab="plan">🧠 学情预测</button>
     <button class="tab" data-tab="profile">📈 成长档案</button>
@@ -185,10 +186,11 @@ select.input { width: auto; min-width: 120px; margin-bottom: 0; }
         <option value="2">第2套</option>
         <option value="3">第3套</option>
       </select>
-      <button class="btn danger" onclick="startPaper()">开始真题演练</button>
+      <button class="btn danger" onclick="startPaper()">开始模考演练</button>
     </div>
     <p style="font-size:12px;color:#a0aec0;margin-bottom:12px;">
-      ⏱️ 四级 125 分钟 / 六级 130 分钟，到点自动交卷
+      ⏱️ 四级 125 分钟 / 六级 130 分钟，到点自动交卷；
+      真题答案未核验时自动使用 AI 模拟卷，不计入真题口径。
     </p>
     <div id="paper-area">
       <p style="color:#718096;font-size:14px;">选择年份和月份后开始演练</p>
@@ -202,8 +204,63 @@ select.input { width: auto; min-width: 120px; margin-bottom: 0; }
       <button class="btn warning" onclick="generateWrongExam()">
         🎯 基于错题生成变式题
       </button>
+      <button class="btn" onclick="analyzeAttribution()">🔎 错题归因分析</button>
     </div>
+    <div id="attribution-area"></div>
     <div id="wrong-area"></div>
+  </div>
+
+  <!-- ========== 4.5 AI 写作/翻译批改 ========== -->
+  <div class="panel" id="grade">
+    <p style="font-size:13px;color:#718096;margin-bottom:12px;">
+      ✍️ 按四六级官方评分标准打分：给出<strong>维度分 + 逐句批注 + 修改建议</strong>，
+      分数可复核（机评 → 人工复核），不是"对照答案自查"。
+    </p>
+
+    <div class="card">
+      <h3>📝 写作批改（15 分制 → 折算 106.5 分）</h3>
+      <div style="display:grid;grid-template-columns:120px 1fr;gap:8px;margin-bottom:8px;">
+        <select class="input" id="writing-level" style="margin-bottom:0;">
+          <option value="CET4">四级</option>
+          <option value="CET6">六级</option>
+        </select>
+        <input class="input" id="writing-topic" style="margin-bottom:0;"
+               placeholder="作文题目/要求（例如：On the Importance of Time Management）">
+      </div>
+      <textarea class="input" id="writing-essay" rows="8"
+        placeholder="粘贴你的作文（建议 120-180 词）"></textarea>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:12px;color:#a0aec0;" id="writing-count">0 词</span>
+        <button class="btn" onclick="gradeWriting()">🤖 开始批改</button>
+      </div>
+      <div id="writing-result" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+      <h3>🔄 翻译批改（15 分制 → 折算 106.5 分）</h3>
+      <div style="display:grid;grid-template-columns:120px 1fr;gap:8px;margin-bottom:8px;">
+        <select class="input" id="translation-level" style="margin-bottom:0;">
+          <option value="CET4">四级</option>
+          <option value="CET6">六级</option>
+        </select>
+        <input class="input" id="translation-reference" style="margin-bottom:0;"
+               placeholder="参考译文（可选，不填则由 AI 给出参考译文）">
+      </div>
+      <textarea class="input" id="translation-source" rows="4"
+        placeholder="中文原文（四六级翻译段落）"></textarea>
+      <textarea class="input" id="translation-user" rows="5"
+        placeholder="你的英文译文"></textarea>
+      <button class="btn" onclick="gradeTranslation()">🤖 开始批改</button>
+      <div id="translation-result" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+      <div class="btn-row" style="margin-bottom:8px;">
+        <h3 style="margin:0;">📚 我的批改记录</h3>
+        <button class="btn" style="margin-left:auto;" onclick="loadGradeRecords()">刷新</button>
+      </div>
+      <div id="grade-records"></div>
+    </div>
   </div>
 
   <!-- ========== 5. 学情诊断 ========== -->
@@ -241,6 +298,17 @@ select.input { width: auto; min-width: 120px; margin-bottom: 0; }
       <button class="btn" style="margin-top:16px;width:100%;" onclick="generateStudyPlan()">
         ✨ 生成专属学习方案
       </button>
+    </div>
+
+    <div class="card" style="margin-top:16px;background:#f0fff4;">
+      <h3>📈 个性化提分方案</h3>
+      <p style="font-size:12px;color:#718096;margin-bottom:12px;">
+        结合真实考试分 / 错题归因 / 写作翻译批改结果，给出分差、薄弱点、每周任务与里程碑。
+      </p>
+      <button class="btn" style="width:100%;" onclick="generateImprovePlan()">
+        🎯 生成提分方案（基于真实学情）
+      </button>
+      <div id="improve-area" style="margin-top:12px;"></div>
     </div>
 
     <div id="plan-area" style="margin-top:16px;">

@@ -444,7 +444,7 @@ async function startPaper() {
   const month = parseInt(document.getElementById('paper-month').value);
   const setNum = parseInt(document.getElementById('paper-set').value);
 
-  if (!confirm(`确定开始 ${year}年${month}月 ${level.toUpperCase()} 第${setNum}套真题演练？`)) return;
+  if (!confirm(`确定开始 ${year}年${month}月 ${level.toUpperCase()} 第${setNum}套模考？`)) return;
 
   area.innerHTML = '<div class="loading">准备试卷中...</div>';
   try {
@@ -455,6 +455,10 @@ async function startPaper() {
     const startData = await startResp.json();
     if (startData.code !== 0) throw new Error(startData.detail);
     paperSession = startData.data;
+    const paperMode = startData.data.mode || 'ai_mock';
+    if (paperMode === 'ai_mock') {
+      showToast('真题答案尚未核验，本次以 AI 模拟卷进行（不计入真题口径）', 3500);
+    }
 
     const paperResp = await fetch('/api/exam/generate', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -477,7 +481,13 @@ function renderPaperTimer(totalSeconds) {
   let remaining = totalSeconds;
   const area = document.getElementById('paper-area');
   const timerId = 'paper-timer-' + Date.now();
-  area.innerHTML = `<div class="timer" id="${timerId}">⏱️ ${formatTime(remaining)}</div>`;
+  const modeBadge = paperSession && paperSession.mode === 'ai_mock'
+    ? '<span class="badge orange" style="margin-left:8px;">AI 模拟卷</span>'
+    : '<span class="badge" style="margin-left:8px;">真题</span>';
+  area.innerHTML = `<div class="timer" id="${timerId}">⏱️ ${formatTime(remaining)}</div>`
+    + `<p style="font-size:12px;color:#a0aec0;margin:4px 0 8px;">${modeBadge}${
+        paperSession && paperSession.notice ? escapeHtml(paperSession.notice) : ''
+      }</p>`;
 
   if (paperTimer) clearInterval(paperTimer);
   paperTimer = setInterval(() => {
@@ -510,10 +520,23 @@ async function submitPaper() {
     question_id: q.question_id, user_answer: userAnswers[i] || ''
   }));
 
-  await fetch('/api/exam/paper/submit', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({session_id: paperSession.session_id, answers: userAnswers})
-  });
+  // ★ 修正：此前提交的是 {0: 'A', 1: 'B'} 这种下标键，后端按 question_id 查不到题，
+  //   导致模考分恒为 220（保底）。这里改为 question_id → 作答 的映射。
+  const paperAnswers = {};
+  currentQuestions.forEach((q, i) => { paperAnswers[q.question_id] = userAnswers[i] || ''; });
+  let paperScore = null;
+  let paperMeta = null;
+  try {
+    const subResp = await fetch('/api/exam/paper/submit', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: paperSession.session_id, answers: paperAnswers})
+    });
+    const subData = await subResp.json();
+    if (subData.code === 0) {
+      paperScore = subData.data.score;
+      paperMeta = subData.data.score_meta;
+    }
+  } catch (e) { /* 提交失败不阻断诊断 */ }
 
   const evalResp = await fetch('/api/exam/evaluate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -525,9 +548,12 @@ async function submitPaper() {
     const area = document.getElementById('paper-area');
     area.insertAdjacentHTML('afterbegin', `
       <div class="card" style="background:#fff5f5;border-color:#fc8181;">
-        <h3>📋 真题演练结束</h3>
+        <h3>📋 模考结束</h3>
         <p>客观题：${g.correct}/${g.objective_total || g.total}，
            正确率 ${(g.accuracy*100).toFixed(0)}%</p>
+        ${paperScore != null ? `<p style="margin-top:8px;">折算模考分：<strong>${paperScore}</strong> / 710</p>` : ''}
+        ${paperMeta && paperMeta.note ? `<p style="font-size:12px;color:#718096;margin-top:4px;">${escapeHtml(paperMeta.note)}</p>` : ''}
+        ${paperMeta && paperMeta.skipped_unverified ? `<p style="font-size:12px;color:#c05621;margin-top:2px;">已跳过 ${paperMeta.skipped_unverified} 道答案未核验题，不计分。</p>` : ''}
       </div>
     `);
   }
@@ -1108,3 +1134,325 @@ if (window.speechSynthesis) {
   window.speechSynthesis.getVoices();
   window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
 }
+// ==================== 9. AI 写作/翻译批改 ====================
+const ERROR_TYPE_LABEL = {
+  vocab: '词汇欠缺', careless: '粗心失误', concept: '概念不清',
+  knowledge_gap: '知识漏洞', inference: '推理偏差', grammar: '语法薄弱',
+};
+const GRADE_STATUS_LABEL = {
+  pending_review: '待复核', approved: '已复核', overridden: '人工改分',
+};
+
+function pct(v) { return Math.round((Number(v) || 0) * 100); }
+
+function scoreColor(score15) {
+  const s = Number(score15) || 0;
+  if (s >= 11) return '#48bb78';
+  if (s >= 8) return '#ed8936';
+  return '#f56565';
+}
+
+function renderModelMeta(meta) {
+  if (!meta) return '';
+  const bits = [];
+  if (meta.provider) bits.push(meta.provider);
+  if (meta.model) bits.push(meta.model);
+  if (meta.prompt_version) bits.push(meta.prompt_version);
+  if (meta.fallback) bits.push('规则兜底评分');
+  if (meta.latency_ms != null) bits.push(Math.round(meta.latency_ms) + 'ms');
+  return bits.length ? `<span style="font-size:11px;color:#a0aec0;">${escapeHtml(bits.join(' · '))}</span>` : '';
+}
+
+async function gradeWriting() {
+  const area = document.getElementById('writing-result');
+  const essay = document.getElementById('writing-essay').value.trim();
+  const topic = document.getElementById('writing-topic').value.trim();
+  const level = document.getElementById('writing-level').value;
+  if (!topic) { showToast('请先填写作文题目/要求'); return; }
+  if (essay.length < 20) { showToast('作文太短，至少 20 个字符'); return; }
+  area.innerHTML = '<div class="loading">🤖 阅卷中：按评分标准打分并逐句批注，约 10-20 秒...</div>';
+  try {
+    const resp = await fetch('/api/grade/writing', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_id: USER_ID, topic, essay, level}),
+    });
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '批改失败');
+    renderWritingGrade(area, data.data);
+    loadGradeRecords();
+  } catch (e) {
+    area.innerHTML = `<div style="color:#f56565;">批改失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderWritingGrade(area, g) {
+  const dims = g.dimensions || {};
+  const dimRow = (label, v, max) => `
+    <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:6px;">
+      <span>${label}</span><span>${Number(v || 0).toFixed(1)} / ${max}</span>
+    </div>
+    <div style="height:6px;background:#e2e8f0;border-radius:3px;overflow:hidden;">
+      <div style="width:${pct((v || 0) / max)}%;height:100%;background:${scoreColor(g.score)};"></div>
+    </div>`;
+  const notes = (g.sentence_notes || []).map(n => `
+    <div style="padding:8px 0;border-bottom:1px solid #edf2f7;font-size:13px;">
+      <p style="color:#718096;">原句：${escapeHtml(n.sentence || '')}</p>
+      <p style="color:#c05621;margin-top:4px;">问题：${escapeHtml(n.issue || '')}</p>
+      <p style="color:#2b6cb0;margin-top:2px;">建议：${escapeHtml(n.suggestion || '')}</p>
+    </div>`).join('');
+  const list = (arr, color) => (arr || []).length
+    ? '<ul style="margin:6px 0 0 18px;font-size:13px;line-height:1.8;">' +
+      arr.map(x => `<li style="color:${color};">${escapeHtml(formatField(x))}</li>`).join('') + '</ul>'
+    : '';
+  area.innerHTML = `
+    <div class="card" style="background:linear-gradient(135deg,#fffaf0,#f0fff4);">
+      <div style="display:flex;align-items:baseline;gap:10px;">
+        <div style="font-size:44px;font-weight:700;color:${scoreColor(g.score)};">${Number(g.score || 0).toFixed(1)}</div>
+        <div style="font-size:13px;color:#718096;">/ 15 分 · 折算 ${Number(g.score_710 || 0).toFixed(1)} / 106.5<br>
+          ${escapeHtml(g.level_band || '')} · ${g.word_count || 0} 词 ·
+          <span class="badge">${GRADE_STATUS_LABEL[g.status] || g.status || ''}</span></div>
+      </div>
+      <p style="font-size:14px;line-height:1.7;margin-top:10px;">${escapeHtml(g.feedback || '')}</p>
+      ${dimRow('内容切题', dims.content, 5)}
+      ${dimRow('语言运用', dims.language, 5)}
+      ${dimRow('组织连贯', dims.organization, 5)}
+      <div style="margin-top:12px;">${renderModelMeta(g.model_meta)}
+        <span style="font-size:11px;color:#a0aec0;">编号 ${escapeHtml(g.grade_id || '')}</span></div>
+    </div>
+    ${(g.strengths || []).length ? `<div class="card"><h3>✅ 做得好的地方</h3>${list(g.strengths, '#2f855a')}</div>` : ''}
+    ${(g.improvements || []).length ? `<div class="card"><h3>🚀 提分建议</h3>${list(g.improvements, '#c05621')}</div>` : ''}
+    ${(g.ai_traces || []).length ? `<div class="card"><h3>🤖 AI/模板痕迹</h3>${list(g.ai_traces, '#805ad5')}</div>` : ''}
+    ${notes ? `<div class="card"><h3>🔍 逐句批注</h3>${notes}</div>` : ''}
+  `;
+}
+
+async function gradeTranslation() {
+  const area = document.getElementById('translation-result');
+  const source = document.getElementById('translation-source').value.trim();
+  const userText = document.getElementById('translation-user').value.trim();
+  const ref = document.getElementById('translation-reference').value.trim();
+  const level = document.getElementById('translation-level').value;
+  if (source.length < 10) { showToast('请先粘贴中文原文'); return; }
+  if (userText.length < 10) { showToast('请先填写你的英文译文'); return; }
+  area.innerHTML = '<div class="loading">🤖 批改中：逐句比对、找漏译/错译/语法问题，约 10-20 秒...</div>';
+  try {
+    const resp = await fetch('/api/grade/translation', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_id: USER_ID, source_text: source,
+                            user_translation: userText, level,
+                            reference_translation: ref || null}),
+    });
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '批改失败');
+    renderTranslationGrade(area, data.data);
+    loadGradeRecords();
+  } catch (e) {
+    area.innerHTML = `<div style="color:#f56565;">批改失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderTranslationGrade(area, g) {
+  const dims = g.dimensions || {};
+  const issues = (g.issues || []).map(it => `
+    <div style="padding:8px 0;border-bottom:1px solid #edf2f7;font-size:13px;">
+      <span class="badge orange">${escapeHtml(it.type || 'issue')}</span>
+      <p style="margin-top:4px;color:#4a5568;">${escapeHtml(it.segment || '')}</p>
+      <p style="color:#c05621;margin-top:2px;">${escapeHtml(it.detail || '')}</p>
+      <p style="color:#2b6cb0;margin-top:2px;">建议：${escapeHtml(it.suggestion || '')}</p>
+    </div>`).join('');
+  area.innerHTML = `
+    <div class="card" style="background:linear-gradient(135deg,#ebf8ff,#f0fff4);">
+      <div style="display:flex;align-items:baseline;gap:10px;">
+        <div style="font-size:44px;font-weight:700;color:${scoreColor(g.score)};">${Number(g.score || 0).toFixed(1)}</div>
+        <div style="font-size:13px;color:#718096;">/ 15 分 · 折算 ${Number(g.score_710 || 0).toFixed(1)} / 106.5<br>
+          ${escapeHtml(g.level_band || '')} ·
+          <span class="badge">${GRADE_STATUS_LABEL[g.status] || g.status || ''}</span></div>
+      </div>
+      <p style="font-size:14px;line-height:1.7;margin-top:10px;">${escapeHtml(g.feedback || '')}</p>
+      <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:8px;">
+        <span>准确度</span><span>${Number(dims.accuracy || 0).toFixed(1)} / 7.5</span></div>
+      <div style="height:6px;background:#e2e8f0;border-radius:3px;overflow:hidden;">
+        <div style="width:${pct((dims.accuracy || 0) / 7.5)}%;height:100%;background:${scoreColor(g.score)};"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:8px;">
+        <span>语言质量</span><span>${Number(dims.language || 0).toFixed(1)} / 7.5</span></div>
+      <div style="height:6px;background:#e2e8f0;border-radius:3px;overflow:hidden;">
+        <div style="width:${pct((dims.language || 0) / 7.5)}%;height:100%;background:${scoreColor(g.score)};"></div></div>
+      <div style="margin-top:12px;">${renderModelMeta(g.model_meta)}</div>
+    </div>
+    ${issues ? `<div class="card"><h3>🔍 逐句问题</h3>${issues}</div>` : ''}
+    ${g.improved_translation ? `<div class="card"><h3>✨ 参考改进译文</h3>
+      <p style="font-size:14px;line-height:1.8;">${escapeHtml(g.improved_translation)}</p></div>` : ''}
+    ${g.reference_translation ? `<div class="card"><h3>📖 参考译文</h3>
+      <p style="font-size:14px;line-height:1.8;">${escapeHtml(g.reference_translation)}</p></div>` : ''}
+  `;
+}
+
+async function loadGradeRecords() {
+  const area = document.getElementById('grade-records');
+  if (!area) return;
+  area.innerHTML = '<div class="loading">加载中...</div>';
+  try {
+    const resp = await fetch('/api/grade/records?user_id=' + encodeURIComponent(USER_ID) + '&limit=20');
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '加载失败');
+    const items = data.data || [];
+    if (!items.length) {
+      area.innerHTML = '<p style="color:#718096;font-size:13px;">还没有批改记录，先上传一篇作文或译文试试</p>';
+      return;
+    }
+    area.innerHTML = items.map(it => {
+      const kind = it.kind === 'translation' ? '🔄 翻译' : '📝 写作';
+      const when = it.created_at ? new Date(it.created_at * 1000).toLocaleString('zh-CN') : '';
+      return `<div style="padding:10px 0;border-bottom:1px solid #edf2f7;font-size:13px;display:flex;justify-content:space-between;gap:8px;">
+        <span>${kind} · <strong style="color:${scoreColor(it.score)};">${Number(it.score || 0).toFixed(1)} 分</strong>
+          <span class="badge">${GRADE_STATUS_LABEL[it.status] || it.status || ''}</span></span>
+        <span style="color:#a0aec0;">${escapeHtml(when)}</span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    area.innerHTML = `<div style="color:#f56565;font-size:13px;">加载失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// ==================== 10. 错题归因 ====================
+async function analyzeAttribution() {
+  const area = document.getElementById('attribution-area');
+  area.innerHTML = '<div class="loading">🔎 归因中：结合题型、答题时长、错题次数、掌握度与解析...</div>';
+  try {
+    const resp = await fetch('/api/wrong/' + encodeURIComponent(USER_ID) + '/attribution', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({use_llm: true, limit: 20}),
+    });
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '归因失败');
+    renderAttribution(area, data.data);
+  } catch (e) {
+    area.innerHTML = `<div style="color:#f56565;">归因失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderAttribution(area, r) {
+  const s = r.summary || {};
+  const byType = s.by_error_type || {};
+  const typeHtml = Object.keys(byType).length ? Object.entries(byType)
+    .map(([k, v]) => `<span class="badge orange" style="margin:2px 4px 2px 0;">${escapeHtml(ERROR_TYPE_LABEL[k] || k)} × ${v}</span>`).join('')
+    : '<span style="font-size:13px;color:#718096;">暂无归因数据</span>';
+  const weak = (s.top_weak_points || []).map(w => `
+    <div style="margin-top:8px;">
+      <div style="display:flex;justify-content:space-between;font-size:13px;">
+        <span>${escapeHtml(w.knowledge_point || '未标注知识点')}</span>
+        <span style="color:#c05621;">错 ${w.wrong_count || 0} 次 · 掌握度 ${pct(w.mastery)}%</span>
+      </div>
+      <div style="height:6px;background:#e2e8f0;border-radius:3px;margin-top:4px;overflow:hidden;">
+        <div style="width:${pct(w.mastery)}%;height:100%;background:#ed8936;"></div>
+      </div>
+    </div>`).join('');
+  const items = (r.items || []).slice(0, 10).map(it => `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#718096;">
+        <span>${escapeHtml(it.question_type || '')} · ${escapeHtml(it.knowledge_point || '')}</span>
+        <span>置信度 ${pct(it.confidence)}%</span>
+      </div>
+      <p style="font-size:13px;margin-top:6px;">
+        <span class="badge orange">${escapeHtml(ERROR_TYPE_LABEL[it.error_type] || it.error_type || '')}</span>
+      </p>
+      <p style="font-size:13px;color:#4a5568;margin-top:6px;">根因：${escapeHtml(it.root_cause || '')}</p>
+      <p style="font-size:13px;color:#2b6cb0;margin-top:4px;">补救：${escapeHtml(it.remediation || '')}</p>
+    </div>`).join('');
+  const recs = (r.recommendations || []).length
+    ? '<ul style="margin:6px 0 0 18px;font-size:13px;line-height:1.8;">' +
+      r.recommendations.map(x => `<li>${escapeHtml(formatField(x))}</li>`).join('') + '</ul>'
+    : '';
+  area.innerHTML = `
+    <div class="card" style="background:linear-gradient(135deg,#fffaf0,#fff5f5);">
+      <h3>🔎 错题归因报告</h3>
+      <p style="font-size:13px;color:#718096;margin-top:6px;">
+        错题 ${s.total_wrong || 0} 道，已归因 ${s.attributed || 0} 道</p>
+      <div style="margin-top:8px;">${typeHtml}</div>
+      ${weak ? `<div style="margin-top:12px;"><strong style="font-size:13px;">📉 最该优先补的知识点</strong>${weak}</div>` : ''}
+      ${recs ? `<div style="margin-top:12px;"><strong style="font-size:13px;">✅ 下一步建议</strong>${recs}</div>` : ''}
+    </div>
+    ${items}`;
+}
+
+// ==================== 11. 个性化提分方案 ====================
+async function generateImprovePlan() {
+  const area = document.getElementById('improve-area');
+  const level = document.getElementById('plan-level').value;
+  const target = parseInt(document.getElementById('plan-target').value) || 425;
+  const days = parseInt(document.getElementById('plan-days').value) || 60;
+  area.innerHTML = '<div class="loading">📈 计算分差、排优先级、生成周计划...</div>';
+  try {
+    const resp = await fetch('/api/plan/improve', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_id: USER_ID, level, target_score: target, days_left: days}),
+    });
+    const data = await resp.json();
+    if (data.code !== 0) throw new Error(data.detail || '生成失败');
+    renderImprovePlan(area, data.data);
+  } catch (e) {
+    area.innerHTML = `<div style="color:#f56565;">生成失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderImprovePlan(area, p) {
+  const cur = p.current_score == null ? '—' : Number(p.current_score).toFixed(0);
+  const gap = p.gap == null ? '—' : Number(p.gap).toFixed(0);
+  const src = p.current_score_source
+    || (p.source_snapshot && p.source_snapshot.current_score && p.source_snapshot.current_score.method)
+    || 'none';
+  const srcLabel = src === 'real_exam' ? '真实考试分'
+    : (src === 'heuristic' ? '学情估算（启发式）' : '暂无数据');
+  const focus = (p.focus_points || []).map(f => `
+    <div style="padding:8px 0;border-bottom:1px solid #edf2f7;font-size:13px;">
+      <div style="display:flex;justify-content:space-between;">
+        <strong>${escapeHtml(f.knowledge_point || f.point || '')}</strong>
+        <span style="color:#c05621;">掌握度 ${pct(f.mastery)}%</span>
+      </div>
+      <p style="color:#718096;margin-top:2px;">${escapeHtml(f.reason || '')}</p>
+    </div>`).join('');
+  const weeks = (p.weekly_schedule || []).map(w => `
+    <div class="card">
+      <h3>第 ${w.week || ''} 周 · ${escapeHtml(w.theme || '')}</h3>
+      <ul style="margin:6px 0 0 18px;font-size:13px;line-height:1.8;">
+        ${(w.tasks || []).map(t => `<li>${escapeHtml(t.type || '')}：
+          <strong>${t.count || ''}</strong> ${escapeHtml(t.unit || '')}
+          <span style="color:#a0aec0;">（${escapeHtml(t.reason || '')}）</span></li>`).join('')}
+      </ul>
+      ${w.milestone ? `<p style="font-size:12px;color:#2f855a;margin-top:6px;">🎯 里程碑：${escapeHtml(w.milestone)}</p>` : ''}
+    </div>`).join('');
+  const actions = (p.actions || []).length
+    ? '<ul style="margin:6px 0 0 18px;font-size:13px;line-height:1.8;">' +
+      p.actions.map(a => `<li>${escapeHtml(formatField(a))}</li>`).join('') + '</ul>'
+    : '';
+  area.innerHTML = `
+    <div class="card" style="background:linear-gradient(135deg,#e6fffa,#ebf8ff);">
+      <div class="stat-grid">
+        <div class="stat"><div class="value">${cur}</div><div class="label">当前分（${srcLabel}）</div></div>
+        <div class="stat"><div class="value">${p.target_score || '—'}</div><div class="label">目标分</div></div>
+        <div class="stat"><div class="value" style="color:#c05621;">${gap}</div><div class="label">分差</div></div>
+        <div class="stat"><div class="value">${p.horizon_days || '—'}</div><div class="label">剩余天数</div></div>
+      </div>
+      ${p.narrative ? `<p style="font-size:14px;line-height:1.8;margin-top:12px;">${escapeHtml(p.narrative)}</p>` : ''}
+      ${p.note ? `<p style="font-size:12px;color:#c05621;margin-top:8px;">⚠️ ${escapeHtml(p.note)}</p>` : ''}
+      ${renderModelMeta(p.model_meta)}
+    </div>
+    ${focus ? `<div class="card"><h3>🎯 优先突破</h3>${focus}</div>` : ''}
+    ${weeks}
+    ${actions ? `<div class="card"><h3>✅ 每日动作清单</h3>${actions}</div>` : ''}
+  `;
+}
+
+// 作文词数实时统计
+document.addEventListener('DOMContentLoaded', () => {
+  const ta = document.getElementById('writing-essay');
+  const counter = document.getElementById('writing-count');
+  if (ta && counter) {
+    const update = () => {
+      const words = ta.value.trim().split(/\s+/).filter(Boolean).length;
+      counter.textContent = words + ' 词';
+    };
+    ta.addEventListener('input', update);
+    update();
+  }
+});

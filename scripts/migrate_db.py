@@ -53,7 +53,23 @@ async def migrate():
                 col = stmt.split("ADD COLUMN ")[1].split()[0]
                 print(f"ℹ️ exam_sessions.{col} 已存在: {e}")
 
-        # 3. 索引
+        # 3. 新表（写作/翻译批改、错题归因、提分方案）
+        #    init_db() 已包含权威建表语句；此处只做旧库的兜底确认，
+        #    保持本脚本"补旧库"的定位，不重复维护第二套 DDL。
+        for table in (
+            "writing_grades",
+            "translation_grades",
+            "wrong_attributions",
+            "improvement_plans",
+        ):
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            )
+            if not await cursor.fetchone():
+                print(f"⚠️ 新表 {table} 缺失，请检查 models/database.py")
+
+        # 4. 索引
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_exam_user ON exam_sessions(user_id)"
         )

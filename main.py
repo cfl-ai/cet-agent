@@ -14,6 +14,9 @@ import shutil
 import sys
 
 from config import settings
+from api.deps import require_admin
+from routers.grading import router as grading_router
+from routers.insight import router as insight_router
 from agents.orchestrator import Orchestrator
 from agents.content_agent import ContentAgent
 from agents.research_agent import ResearchAgent
@@ -72,6 +75,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CET AI Agent", lifespan=lifespan)
 
+# 写作/翻译批改、错题归因、个性化提分方案等新能力以 APIRouter 挂载，
+# main.py 只保留应用装配，避免路由越堆越长。
+app.include_router(grading_router)
+app.include_router(insight_router)
+
 orchestrator = Orchestrator()
 content_agent = ContentAgent()
 research_agent = ResearchAgent()
@@ -79,19 +87,8 @@ study_plan_agent = StudyPlanAgent()
 
 
 # ==================== 管理接口鉴权 ====================
-async def require_admin(x_admin_token: str = Header(default=None)):
-    """
-    管理接口统一鉴权。
-    - 服务端未配置 ADMIN_TOKEN 时直接拒绝，避免接口裸奔
-    - 令牌不匹配返回 401
-    """
-    if not settings.ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="服务端未配置 ADMIN_TOKEN，管理接口已禁用"
-        )
-    if x_admin_token != settings.ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="管理接口鉴权失败")
+# 鉴权实现已抽到 api/deps.py（恒定时间比较 + 新路由可复用），
+# 此处通过 import 复用，避免两套逻辑漂移。
 
 
 # 上传白名单：只接受文档与文本，防止上传可执行文件或脚本
@@ -206,36 +203,74 @@ def _section_of(qtype: str) -> str | None:
     return None
 
 
-def _estimate_paper_score(answers: dict, qmap: dict,
-                          subjective_types: set) -> int:
+def _estimate_paper_score(answers: dict, qmap: dict, subjective_types: set,
+                          latest_subjective: dict | None = None) -> tuple[int, dict]:
+    """把模考作答折算成标准分（只认真实可判定的作答）。
+
+    真实判分的三条原则：
+      1. 客观题答案归一化后比较（全角/空格/大小写/多选顺序不影响结果）；
+      2. 答案缺失或未核验（真题导入时 answer 被硬编码为 "A" 且 verified=0）
+         的题直接跳过，不计分也不计入分母——否则会把系统性错误算到用户头上；
+      3. 主观题不再按固定 65% 估分：仅有当用户近期真正做过 AI 批改且分数可查时
+         才折算计入，否则记 0 并明确标注"主观题未评分"。
+    返回 (分数, 明细)；明细用于前端说明这次分数的适用范围。
     """
-    把模考作答折算成标准分。
-    此前 paper/submit 恒写 score=0，等于白白丢掉一个真实监督信号源。
-    未作答的部分不计分（如实反映发挥），总分保底 220（四六级报道分下限）。
-    """
+    latest_subjective = latest_subjective or {}
     stats: dict[str, list] = {}
+    skipped_unverified = 0
+    subjective_scored: list[str] = []
+    subjective_missing: list[str] = []
+
     for qid, user_ans in (answers or {}).items():
         info = qmap.get(qid)
         if not info:
             continue
-        qtype, correct_ans = info
+        qtype, correct_ans, source, verified = info
         section = _section_of(qtype) or "阅读"
         answered = str(user_ans or "").strip()
 
         if qtype in subjective_types:
-            correct = SUBJECTIVE_BASELINE if answered else 0.0
-        elif not correct_ans:
-            continue
+            kind = "writing" if "写作" in qtype else "translation"
+            graded = latest_subjective.get(kind)
+            if not answered:
+                correct = 0.0
+                subjective_missing.append(qtype)
+            elif graded is not None:
+                # 批改分是 0-15 原始分，折算成该部分占比
+                correct = max(0.0, min(1.0, float(graded) / 15.0))
+                subjective_scored.append(kind)
+            else:
+                correct = 0.0
+                subjective_missing.append(qtype)
         else:
-            correct = (1.0 if answered.upper() == str(correct_ans).strip().upper()
-                       else 0.0)
+            if not correct_ans:
+                skipped_unverified += 1
+                continue
+            if not verified and str(source or "").startswith("real_"):
+                skipped_unverified += 1
+                continue
+            user_norm = GradingAgent._normalize_answer(answered)
+            correct_norm = GradingAgent._normalize_answer(correct_ans)
+            correct = 1.0 if user_norm and user_norm == correct_norm else 0.0
 
         total, got = stats.get(section, [0, 0.0])
         stats[section] = [total + 1, got + correct]
 
     score = sum((got / total) * SECTION_WEIGHTS[section]
                 for section, (total, got) in stats.items() if total)
-    return max(SCORE_FLOOR, min(710, int(round(score))))
+    score = max(SCORE_FLOOR, min(710, int(round(score))))
+    meta = {
+        "skipped_unverified": skipped_unverified,
+        "subjective_scored": sorted(set(subjective_scored)),
+        "subjective_missing": sorted(set(subjective_missing)),
+        "note": (
+            "本次模考分只计入可判定作答；主观题未做 AI 批改的部分记 0，"
+            "请到「✍️ AI 批改」提交作文/译文获取真实分数。"
+            if subjective_missing else
+            "主观题分数取自近期 AI 批改结果。"
+        ),
+    }
+    return score, meta
 
 
 # ==================== 工具函数 ====================
@@ -546,9 +581,22 @@ async def paper_start(req: PaperStartRequest):
         ))
         await db.commit()
 
+    # 真题可用性：只有"已核验"的真题才能作为真题口径。
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM questions "
+            "WHERE source LIKE 'real_%' AND verified=1"
+        )
+        (verified_real,) = await cursor.fetchone()
+    mode = "real" if (verified_real or 0) > 0 else "ai_mock"
+    notice = (
+        "真题库已核验，按真题口径计分。"
+        if mode == "real" else
+        "真题答案尚未核验，本次以 AI 模拟卷进行，成绩不计入真题口径。"
+    )
     return {"code": 0, "data": {
         "session_id": session_id, "duration_seconds": duration,
-        "started_at": time.time(),
+        "started_at": time.time(), "mode": mode, "notice": notice,
     }}
 
 
@@ -574,11 +622,29 @@ async def paper_submit(req: PaperSubmitRequest):
         if qids:
             placeholders = ",".join("?" * len(qids))
             cursor = await db.execute(
-                f"SELECT question_id, question_type, answer FROM questions "
-                f"WHERE question_id IN ({placeholders})", qids)
-            qmap = {r[0]: (r[1] or "", r[2] or "") for r in await cursor.fetchall()}
-        score = _estimate_paper_score(
-            req.answers, qmap, GradingAgent.SUBJECTIVE_TYPES)
+                f"SELECT question_id, question_type, answer, source, verified "
+                f"FROM questions WHERE question_id IN ({placeholders})", qids)
+            qmap = {
+                r[0]: (r[1] or "", r[2] or "", r[3] or "", r[4] or 0)
+                for r in await cursor.fetchall()
+            }
+        # 主观题不估分：只有用户近期真的做过 AI 批改，才用真实批改分折算
+        latest_subjective = {}
+        cursor = await db.execute(
+            "SELECT score FROM writing_grades WHERE user_id=? "
+            "ORDER BY created_at DESC LIMIT 1", (user_id,))
+        row_w = await cursor.fetchone()
+        if row_w and row_w[0] is not None:
+            latest_subjective["writing"] = row_w[0]
+        cursor = await db.execute(
+            "SELECT score FROM translation_grades WHERE user_id=? "
+            "ORDER BY created_at DESC LIMIT 1", (user_id,))
+        row_t = await cursor.fetchone()
+        if row_t and row_t[0] is not None:
+            latest_subjective["translation"] = row_t[0]
+        score, score_meta = _estimate_paper_score(
+            req.answers, qmap, GradingAgent.SUBJECTIVE_TYPES,
+            latest_subjective=latest_subjective)
 
         await db.execute("""
             UPDATE exam_sessions SET ended_at=?, status=?, answers=?, score=?
@@ -593,7 +659,7 @@ async def paper_submit(req: PaperSubmitRequest):
 
     return {"code": 0, "data": {
         "session_id": req.session_id, "status": status, "elapsed": elapsed,
-        "score": score,
+        "score": score, "score_meta": score_meta,
     }}
 
 

@@ -177,8 +177,112 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_exam_score_user "
             "ON user_exam_scores(user_id)")
 
+        # ==================== 主观题批改 ====================
+        # 写作批改结果。score 为四六级写作 15 分制原始分，
+        # score_710 为折算后的 106.5 分制得分（写作占 15%）。
+        # status 支持"机评 → 人工复核"两段式：pending_review / approved / overridden。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS writing_grades (
+                grade_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                level TEXT DEFAULT 'CET4',
+                topic TEXT,
+                essay TEXT,
+                word_count INTEGER DEFAULT 0,
+                score REAL,
+                score_710 REAL,
+                level_band TEXT,
+                content_score REAL,
+                language_score REAL,
+                organization_score REAL,
+                feedback TEXT,
+                strengths TEXT,
+                improvements TEXT,
+                sentence_notes TEXT,
+                ai_traces TEXT,
+                status TEXT DEFAULT 'pending_review',
+                reviewer_note TEXT,
+                reviewed_at REAL,
+                model_meta TEXT,
+                created_at REAL
+            )
+        """)
+
+        # 翻译批改结果。issues 记录逐句问题（漏译/错译/语法/用词），
+        # 是"真实判分"的核心证据：分数必须能对应到具体句子，而非一句笼统评语。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS translation_grades (
+                grade_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                level TEXT DEFAULT 'CET4',
+                source_text TEXT,
+                user_translation TEXT,
+                reference_translation TEXT,
+                score REAL,
+                score_710 REAL,
+                level_band TEXT,
+                accuracy_score REAL,
+                language_score REAL,
+                feedback TEXT,
+                issues TEXT,
+                improved_translation TEXT,
+                status TEXT DEFAULT 'pending_review',
+                reviewer_note TEXT,
+                reviewed_at REAL,
+                model_meta TEXT,
+                created_at REAL
+            )
+        """)
+
+        # ==================== 错题归因 ====================
+        # 每道错题一条归因：错因 + 知识点 + 根因 + 补救动作 + 置信度。
+        # evidence 保存判定依据（时长/相似选项/掌握度/错因规则），
+        # 便于解释"为什么判成这个概念不清"，也支持人工复核。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS wrong_attributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                knowledge_point TEXT,
+                error_type TEXT,
+                confidence REAL DEFAULT 0.5,
+                root_cause TEXT,
+                remediation TEXT,
+                evidence TEXT,
+                source TEXT DEFAULT 'rules',
+                created_at REAL,
+                UNIQUE(user_id, question_id)
+            )
+        """)
+
+        # ==================== 个性化提分方案 ====================
+        # source_snapshot 固化生成时的学情快照，保证方案可复算、可追溯；
+        # model_meta 记录是否走了 LLM 或模板兜底。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS improvement_plans (
+                plan_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                level TEXT,
+                current_score REAL,
+                target_score REAL,
+                gap REAL,
+                horizon_days INTEGER,
+                focus_points TEXT,
+                weekly_schedule TEXT,
+                actions TEXT,
+                narrative TEXT,
+                source_snapshot TEXT,
+                model_meta TEXT,
+                created_at REAL
+            )
+        """)
+
         # 索引
         await db.execute("CREATE INDEX IF NOT EXISTS idx_answer_user ON answer_records(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_writing_user ON writing_grades(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_translation_user ON translation_grades(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_attr_user ON wrong_attributions(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_plan_user ON improvement_plans(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_wrong_user ON wrong_questions(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_kstate_user ON knowledge_state(user_id)")
 
